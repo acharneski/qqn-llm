@@ -1,0 +1,3 @@
+[submodule "qqn-jax"]
+	path = qqn-jax
+	url = git@github.com:SimiaCryptus/qqn-jax.git
