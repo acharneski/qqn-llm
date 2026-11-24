@@ -208,7 +208,7 @@ def load_dataset_bundle(
     print(f"[qqn-llm] Loading tokenizer and dataset ({cfg.source})...", flush=True)
     tokenizer = _get_gemma_tokenizer()
     train_pairs, val_pairs = _load_text_pairs(cfg)
-    use_chat = cfg.source == "jsonl" and cfg.chat_format
+    use_chat = bool(cfg.chat_format)
     print(
         f"[qqn-llm] Tokenizing {len(train_pairs)} train / {len(val_pairs)} val examples "
         f"(seq_len={cfg.seq_len}, chat_format={use_chat})...",

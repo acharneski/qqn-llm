@@ -46,6 +46,10 @@ def _phase_to_opt_cfg(name: str, phase: PhaseConfig) -> OptimizerConfig:
         spline_max_control_points=phase.spline_max_control_points,
         use_lr_schedule=phase.use_lr_schedule,
         clear_lbfgs_on_refresh=phase.clear_lbfgs_on_refresh,
+        tangent_mode=phase.tangent_mode,
+        beta2=phase.beta2,
+        max_qn_gain=phase.max_qn_gain,
+        anchor_weight_decay=phase.anchor_weight_decay,
         learning_rate=phase.learning_rate,
         warmup_ratio=phase.warmup_ratio,
         weight_decay=phase.weight_decay,
@@ -76,6 +80,11 @@ def _resolve_phases(exp_cfg: ExperimentConfig, opt_cfg: OptimizerConfig) -> list
             spline_max_control_points=opt_cfg.spline_max_control_points,
             use_lr_schedule=opt_cfg.use_lr_schedule,
             clear_lbfgs_on_refresh=opt_cfg.clear_lbfgs_on_refresh,
+            tangent_mode=opt_cfg.tangent_mode,
+            warm_start_preconditioner=True,
+            beta2=opt_cfg.beta2,
+            max_qn_gain=opt_cfg.max_qn_gain,
+            anchor_weight_decay=opt_cfg.anchor_weight_decay,
             learning_rate=opt_cfg.learning_rate,
             warmup_ratio=opt_cfg.warmup_ratio,
             weight_decay=opt_cfg.weight_decay,
@@ -106,11 +115,7 @@ def _shard_batch(batch: dict[str, jnp.ndarray], bundle: ModelBundle) -> dict[str
 
 
 def _compute_weight_deviation(params, init_params) -> dict[str, float]:
-    """Compute exact L1 and L2 distance from baseline weights leaf-by-leaf on CPU.
-
-    Operates one leaf at a time on the host in float64 so it uses zero extra
-    GPU VRAM even on 4.65B-parameter FSDP models.
-    """
+    """Host fallback computing exact L1/L2 distance leaf-by-leaf in float64."""
     l1_total = 0.0
     l2_sq_total = 0.0
     n_total = 0
@@ -131,25 +136,86 @@ def _compute_weight_deviation(params, init_params) -> dict[str, float]:
     }
 
 
+def _make_device_weight_deviation_fn(sharded_anchor_params, mesh, num_params: int):
+    """Build an FSDP-resident L1/L2 deviation reducer returning <4 KB of per-leaf scalars.
+
+    Reduces each FSDP-sharded tensor on-device in float32 and accumulates the
+    per-leaf partial sums on host in float64 — avoiding 18.6 GB PCIe transfers
+    every evaluation step.
+    """
+    replicated = NamedSharding(mesh, P())
+
+    @jax.jit
+    def _leaf_stats(params, anchor):
+        l1_leaves = [
+            jax.lax.with_sharding_constraint(
+                jnp.sum(
+                    jnp.abs(p.astype(jnp.float32) - p0.astype(jnp.float32)),
+                    dtype=jnp.float32,
+                ),
+                replicated,
+            )
+            for p, p0 in zip(
+                jax.tree_util.tree_leaves(params),
+                jax.tree_util.tree_leaves(anchor),
+            )
+        ]
+        l2_sq_leaves = [
+            jax.lax.with_sharding_constraint(
+                jnp.sum(
+                    (p.astype(jnp.float32) - p0.astype(jnp.float32)) ** 2,
+                    dtype=jnp.float32,
+                ),
+                replicated,
+            )
+            for p, p0 in zip(
+                jax.tree_util.tree_leaves(params),
+                jax.tree_util.tree_leaves(anchor),
+            )
+        ]
+        return jnp.stack(l1_leaves), jnp.stack(l2_sq_leaves)
+
+    n_safe = max(1, int(num_params))
+
+    def compute(params) -> dict[str, float]:
+        l1_vec, l2_sq_vec = _leaf_stats(params, sharded_anchor_params)
+        l1_total = float(np.sum(np.asarray(l1_vec, dtype=np.float64), dtype=np.float64))
+        l2_sq_total = float(
+            np.sum(np.asarray(l2_sq_vec, dtype=np.float64), dtype=np.float64)
+        )
+        l2_total = math.sqrt(max(0.0, l2_sq_total))
+        return {
+            "weight_l1_dist": l1_total,
+            "weight_l2_dist": l2_total,
+            "weight_l1_mean": l1_total / n_safe,
+            "weight_l2_rms": l2_total / math.sqrt(n_safe),
+        }
+
+    return compute
+
+
 def run_single_optimizer(
     exp_cfg: ExperimentConfig,
     opt_cfg: OptimizerConfig,
     bundle: ModelBundle,
     data: DatasetBundle,
     output_dir: Path,
-    loss_fn,
+    base_train_loss_fn,
     eval_loss_jit,
     sharded_val_batch: dict[str, jnp.ndarray],
+    sharded_anchor_params,
+    deviation_fn,
+    master_dtype,
 ) -> dict[str, Any]:
     """Run one optimizer configuration (single- or multi-phase) and write JSON telemetry."""
     phases = _resolve_phases(exp_cfg, opt_cfg)
     total_planned_steps = sum(p.steps for p in phases)
 
-    print(f"[{opt_cfg.name}] Placing initial parameters onto FSDP mesh...", flush=True)
-    params = jax.device_put(
-        jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), bundle.params),
-        bundle.param_sharding,
-    )
+    print(f"[{opt_cfg.name}] Initializing master parameters on FSDP mesh...", flush=True)
+    params = jax.jit(
+        lambda p0: jax.tree_util.tree_map(lambda x: x.astype(master_dtype), p0),
+        out_shardings=bundle.param_sharding,
+    )(sharded_anchor_params)
 
     init_val = float(eval_loss_jit(params, sharded_val_batch))
     init_train_loss: float | None = None
@@ -158,6 +224,8 @@ def run_single_optimizer(
     total_train_sec = 0.0
     steady_train_sec = 0.0
     best_val_loss = init_val
+    best_val_step = 0
+    best_val_evals = 0
     best_val_weight_l1 = 0.0
     best_val_weight_l2 = 0.0
     final_dev = {
@@ -169,11 +237,23 @@ def run_single_optimizer(
     global_step = 0
     cum_evals = 0
     cum_tokens = 0
+    carry_precond: tuple[Any, int] | None = None
 
     for phase_idx, phase in enumerate(phases):
         phase_opt_cfg = _phase_to_opt_cfg(opt_cfg.name, phase)
+        if phase.anchor_weight_decay > 0.0:
+            phase_loss_fn = make_accumulated_loss_fn(
+                bundle.forward_fn,
+                l2_reg=exp_cfg.training.l2_reg,
+                mesh=bundle.mesh,
+                anchor_params=sharded_anchor_params,
+                anchor_l2_reg=phase.anchor_weight_decay,
+            )
+        else:
+            phase_loss_fn = base_train_loss_fn
+
         runner = _make_runner(
-            loss_fn, phase_opt_cfg, total_steps=phase.steps, bundle=bundle
+            phase_loss_fn, phase_opt_cfg, total_steps=phase.steps, bundle=bundle
         )
         host_stepped = bool(getattr(runner, "is_host_stepped", False))
 
@@ -213,15 +293,29 @@ def run_single_optimizer(
 
         t_phase_init = time.perf_counter()
         phase_tag = f"{opt_cfg.name}:{phase.name}" if len(phases) > 1 else opt_cfg.name
+        warm_to_use = carry_precond if phase.warm_start_preconditioner else None
+        carry_precond = None
+        warm_note = (
+            f", warm_v_step={warm_to_use[1]}"
+            if (warm_to_use is not None and warm_to_use[0] is not None)
+            else ""
+        )
         print(
             f"[{phase_tag}] Compiling & running init (kind={phase.kind}, "
             f"oracle={phase.oracle if phase.kind == 'qqn' else '-'}, "
-            f"batch shape={first_batch['input_ids'].shape}, inner={phase.inner_steps_per_batch})...",
+            f"batch shape={first_batch['input_ids'].shape}, inner={phase.inner_steps_per_batch}{warm_note})...",
             flush=True,
         )
-        state = init_fn(params, first_batch)
-        if not host_stepped:
+        if host_stepped:
+            state = init_fn(params, first_batch, warm_precond=warm_to_use)
+        else:
+            state = init_fn(params, first_batch)
+            if warm_to_use is not None and hasattr(runner, "apply_warm_preconditioner"):
+                state = runner.apply_warm_preconditioner(state, warm_to_use)
+                state = jax.device_put(state, state_sharding)
             jax.block_until_ready(state)
+        del warm_to_use
+
         phase_init_sec = time.perf_counter() - t_phase_init
         compile_and_init_sec += phase_init_sec
         if init_train_loss is None:
@@ -239,13 +333,14 @@ def run_single_optimizer(
         cum_tokens += prev_phase_evals * tokens_per_batch
         consecutive_stalls = 0
         stopped_early_reason: str | None = None
+        inner_k = max(1, phase.inner_steps_per_batch)
 
         for local_step in range(1, phase.steps + 1):
             global_step += 1
             if (
                 batch_iter is not None
                 and local_step > 1
-                and (local_step - 1) % max(1, phase.inner_steps_per_batch) == 0
+                and (local_step - 1) % inner_k == 0
             ):
                 current_batch = _shard_batch(next(batch_iter), bundle)
                 tokens_per_batch = int(jnp.sum(current_batch["loss_mask"]))
@@ -253,9 +348,19 @@ def run_single_optimizer(
                 if not host_stepped:
                     jax.block_until_ready(state)
 
+            will_refresh_next = (
+                batch_iter is not None
+                and local_step < phase.steps
+                and (local_step % inner_k == 0)
+            )
+
             t0 = time.perf_counter()
-            params, state, metrics = step_fn(params, state, current_batch)
-            if not host_stepped:
+            if host_stepped:
+                params, state, metrics = step_fn(
+                    params, state, current_batch, will_refresh_next=will_refresh_next
+                )
+            else:
+                params, state, metrics = step_fn(params, state, current_batch)
                 jax.block_until_ready(metrics["loss"])
             dt = time.perf_counter() - t0
             total_train_sec += dt
@@ -312,13 +417,15 @@ def run_single_optimizer(
                 or should_stop
             ):
                 val_loss = float(eval_loss_jit(params, sharded_val_batch))
-                dev = _compute_weight_deviation(params, bundle.params)
+                dev = deviation_fn(params)
                 final_dev = dev
                 rec["val_loss"] = val_loss
                 rec["val_ppl"] = float(math.exp(min(val_loss, 20.0)))
                 rec.update(dev)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    best_val_step = global_step
+                    best_val_evals = cum_evals
                     best_val_weight_l1 = dev["weight_l1_dist"]
                     best_val_weight_l2 = dev["weight_l2_dist"]
                     if exp_cfg.training.save_best_checkpoint:
@@ -378,10 +485,17 @@ def run_single_optimizer(
                 )
                 break
 
-        # Release phase optimizer state before starting next phase so VRAM never overlaps
+        # Export diagonal preconditioner (v, step) for seamless Phase-2 handoff before freeing state
+        if (
+            phase_idx + 1 < len(phases)
+            and phases[phase_idx + 1].warm_start_preconditioner
+            and hasattr(runner, "export_preconditioner")
+        ):
+            carry_precond = runner.export_preconditioner(state)
         del state, runner
         gc.collect()
 
+    del carry_precond
     if exp_cfg.training.save_final_checkpoint:
         final_ckpt_path = output_dir / "checkpoints" / f"{opt_cfg.name}_final"
         print(
@@ -419,6 +533,8 @@ def run_single_optimizer(
         "init_train_loss": init_train_loss if init_train_loss is not None else 0.0,
         "init_val_loss": init_val,
         "best_val_loss": best_val_loss,
+        "best_val_step": best_val_step,
+        "best_val_evals": best_val_evals,
         "best_val_weight_l1_dist": best_val_weight_l1,
         "best_val_weight_l2_dist": best_val_weight_l2,
         "final_weight_l1_dist": final_dev["weight_l1_dist"],
@@ -444,6 +560,8 @@ def run_experiment(
     exp_cfg: ExperimentConfig, output_dir: str | Path | None = None
 ) -> list[dict[str, Any]]:
     """Run all optimizers configured in ``exp_cfg``."""
+    from qqn_llm.model import resolve_dtype
+
     out_path = Path(output_dir or exp_cfg.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -460,10 +578,26 @@ def run_experiment(
     print(f"[qqn-llm] Loaded {bundle.num_params:,} trainable parameters.", flush=True)
     data = load_dataset_bundle(exp_cfg.data, bundle.vocab_size, exp_cfg.seed)
 
-    loss_fn = make_accumulated_loss_fn(
+    master_dtype = resolve_dtype(exp_cfg.model.master_dtype)
+    sharded_anchor_params = jax.device_put(
+        jax.tree_util.tree_map(
+            lambda x: jnp.asarray(x, dtype=bundle.init_param_dtype), bundle.params
+        ),
+        bundle.param_sharding,
+    )
+    deviation_fn = _make_device_weight_deviation_fn(
+        sharded_anchor_params, bundle.mesh, bundle.num_params
+    )
+
+    base_train_loss_fn = make_accumulated_loss_fn(
         bundle.forward_fn, l2_reg=exp_cfg.training.l2_reg, mesh=bundle.mesh
     )
-    eval_loss_jit = jax.jit(loss_fn)
+    eval_loss_fn = (
+        base_train_loss_fn
+        if exp_cfg.training.l2_reg == 0.0
+        else make_accumulated_loss_fn(bundle.forward_fn, l2_reg=0.0, mesh=bundle.mesh)
+    )
+    eval_loss_jit = jax.jit(eval_loss_fn)
     sharded_val_batch = _shard_batch(data.val_batch, bundle)
 
     results = []
@@ -475,9 +609,12 @@ def run_experiment(
                 bundle,
                 data,
                 out_path,
-                loss_fn=loss_fn,
+                base_train_loss_fn=base_train_loss_fn,
                 eval_loss_jit=eval_loss_jit,
                 sharded_val_batch=sharded_val_batch,
+                sharded_anchor_params=sharded_anchor_params,
+                deviation_fn=deviation_fn,
+                master_dtype=master_dtype,
             )
             results.append(res)
         except Exception as exc:

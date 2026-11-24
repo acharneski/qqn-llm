@@ -77,6 +77,11 @@ class PhaseConfig:
     spline_max_control_points: int = 8
     use_lr_schedule: bool = True
     clear_lbfgs_on_refresh: bool = True
+    tangent_mode: Literal["raw", "reparam", "scaled", "preconditioned"] = "raw"
+    warm_start_preconditioner: bool = True
+    beta2: float = 0.98
+    max_qn_gain: float = 4.0
+    anchor_weight_decay: float = 0.0
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
@@ -92,6 +97,7 @@ class OptimizerConfig:
     history_size: int = 5
     line_search: str = "backtracking"  # backtracking | strong_wolfe | null | fixed
     path_strategy: str = "quadratic"   # quadratic | linear | spline
+    tangent_mode: Literal["raw", "reparam", "scaled", "preconditioned"] = "raw"
     c1: float = 1e-6
     c2: float = 0.9
     ls_max_iter: int = 5
@@ -101,6 +107,9 @@ class OptimizerConfig:
     spline_max_control_points: int = 8
     use_lr_schedule: bool = False
     clear_lbfgs_on_refresh: bool = True
+    beta2: float = 0.98
+    max_qn_gain: float = 4.0
+    anchor_weight_decay: float = 0.0
     # AdamW / AdamOracle options
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1

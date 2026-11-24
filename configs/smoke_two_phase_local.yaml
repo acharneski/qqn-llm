@@ -27,7 +27,7 @@ data:
 
 training:
   steps: 10
-  eval_every: 5
+  eval_every: 2
   checkpoint_every: 0
   l2_reg: 0.0
   fsdp_axis_size: 1
@@ -49,6 +49,36 @@ optimizers:
         macro_batch_examples: 48
         inner_steps_per_batch: 2
         learning_rate: 1.0e-3
+        warmup_ratio: 0.0
+        warm_start_preconditioner: true
+
+  - name: two_phase_adamw_to_lbfgs_adam
+    kind: qqn
+    phases:
+      - name: rough_adamw
+        kind: adamw
+        steps: 6
+        macro_batch_examples: 16
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-3
+      - name: polish_lbfgs_adam_sw
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        tangent_mode: preconditioned
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-3
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 4
+        macro_batch_examples: 48
+        inner_steps_per_batch: 2
 
   - name: two_phase_qqn_adam_to_lbfgs_adam
     kind: qqn
@@ -57,6 +87,7 @@ optimizers:
         kind: qqn
         oracle: adam
         line_search: backtracking
+        tangent_mode: preconditioned
         max_t: 1.0
         learning_rate: 2.0e-3
         use_lr_schedule: true
@@ -68,11 +99,14 @@ optimizers:
         oracle: lbfgs_adam
         history_size: 4
         line_search: strong_wolfe
+        tangent_mode: preconditioned
+        warm_start_preconditioner: true
         c1: 1.0e-4
         c2: 0.9
         ls_max_iter: 4
         max_t: 2.0
         learning_rate: 1.0e-3
+        anchor_weight_decay: 1.0e-3
         use_lr_schedule: true
         clear_lbfgs_on_refresh: true
         steps: 4

@@ -20,37 +20,80 @@ class BaselineState(NamedTuple):
     grad_norm: jnp.ndarray
 
 
+def _extract_adam_nu_and_count(tree: Any) -> tuple[Any, int] | None:
+    """Recursively locate ``ScaleByAdamState(count, mu, nu)`` inside an Optax state tuple."""
+    if hasattr(tree, "nu") and hasattr(tree, "count") and hasattr(tree, "mu"):
+        return tree.nu, int(tree.count)
+    if isinstance(tree, tuple):
+        for elem in tree:
+            found = _extract_adam_nu_and_count(elem)
+            if found is not None:
+                return found
+    return None
+
+
+def _inject_adam_nu_and_count(tree: Any, nu_warm: Any, step_warm: int) -> Any:
+    """Return a copy of ``tree`` with ``ScaleByAdamState.(nu, count)`` warm-started."""
+    if hasattr(tree, "nu") and hasattr(tree, "count") and hasattr(tree, "mu"):
+        nu_cast = jax.tree_util.tree_map(
+            lambda w, ref: w.astype(ref.dtype), nu_warm, tree.nu
+        )
+        cnt = jnp.asarray(max(0, int(step_warm)), dtype=tree.count.dtype)
+        return tree._replace(nu=nu_cast, count=cnt)
+    if isinstance(tree, tuple):
+        items = [_inject_adam_nu_and_count(elem, nu_warm, step_warm) for elem in tree]
+        if hasattr(tree, "_fields"):
+            return type(tree)(*items)
+        return tuple(items)
+    return tree
+
+
 class AdamWRunner:
     """Standard full-weight LLM fine-tuning baseline: warmup + cosine AdamW."""
 
     def __init__(self, loss_fn: Callable, cfg: OptimizerConfig, total_steps: int):
         self.loss_fn = loss_fn
         self.cfg = cfg
-        warmup_steps = max(1, int(cfg.warmup_ratio * total_steps))
-        decay_steps = max(1, total_steps - warmup_steps)
-        schedule = optax.join_schedules(
-            schedules=[
-                optax.linear_schedule(
-                    init_value=0.0,
-                    end_value=cfg.learning_rate,
-                    transition_steps=warmup_steps,
-                ),
-                optax.cosine_decay_schedule(
-                    init_value=cfg.learning_rate,
-                    decay_steps=decay_steps,
-                    alpha=0.1,
-                ),
-            ],
-            boundaries=[warmup_steps],
-        )
-        self.tx = optax.chain(
-            optax.clip_by_global_norm(cfg.grad_clip_norm),
+        warmup_steps = max(0, int(round(cfg.warmup_ratio * total_steps)))
+        if warmup_steps > 0:
+            decay_steps = max(1, total_steps - warmup_steps)
+            # Start at lr / (warmup_steps + 1) rather than 0.0 so step 1 (count=0)
+            # performs a genuine warmup update instead of a wasted zero-LR pass.
+            init_lr = float(cfg.learning_rate) / float(warmup_steps + 1)
+            schedule = optax.join_schedules(
+                schedules=[
+                    optax.linear_schedule(
+                        init_value=init_lr,
+                        end_value=cfg.learning_rate,
+                        transition_steps=warmup_steps,
+                    ),
+                    optax.cosine_decay_schedule(
+                        init_value=cfg.learning_rate,
+                        decay_steps=decay_steps,
+                        alpha=0.1,
+                    ),
+                ],
+                boundaries=[warmup_steps],
+            )
+        else:
+            schedule = optax.cosine_decay_schedule(
+                init_value=cfg.learning_rate,
+                decay_steps=max(1, total_steps),
+                alpha=0.1,
+            )
+
+        transforms = []
+        if cfg.grad_clip_norm > 0.0:
+            transforms.append(optax.clip_by_global_norm(cfg.grad_clip_norm))
+        transforms.append(
             optax.adamw(
                 learning_rate=schedule,
+                b2=cfg.beta2,
                 weight_decay=cfg.weight_decay,
                 mu_dtype=jnp.float32,
-            ),
+            )
         )
+        self.tx = optax.chain(*transforms)
         self._value_and_grad = jax.value_and_grad(loss_fn)
 
     def init(self, params, macro_batch):
@@ -63,6 +106,19 @@ class AdamWRunner:
             value=val,
             grad_norm=jnp.asarray(0.0, jnp.float32),
         )
+
+    def apply_warm_preconditioner(
+        self, state: BaselineState, warm_precond: tuple[Any, int] | None
+    ) -> BaselineState:
+        if warm_precond is None or warm_precond[0] is None:
+            return state
+        new_opt_state = _inject_adam_nu_and_count(
+            state.opt_state, warm_precond[0], warm_precond[1]
+        )
+        return state._replace(opt_state=new_opt_state)
+
+    def export_preconditioner(self, state: BaselineState) -> tuple[Any, int] | None:
+        return _extract_adam_nu_and_count(state.opt_state)
 
     def refresh(self, params, state, macro_batch):
         return state
@@ -121,6 +177,14 @@ class OptaxLBFGSRunner:
             grad_norm=jnp.asarray(0.0, jnp.float32),
         )
 
+    def apply_warm_preconditioner(self, state: BaselineState, warm_precond) -> BaselineState:
+        del warm_precond
+        return state
+
+    def export_preconditioner(self, state: BaselineState) -> tuple[Any, int] | None:
+        del state
+        return None
+
     def refresh(self, params, state, macro_batch):
         return state
 
@@ -137,8 +201,6 @@ class OptaxLBFGSRunner:
         new_params = jax.tree_util.tree_map(
             lambda new_p, old_p: new_p.astype(old_p.dtype), new_params, params
         )
-        # Optax zoom line search does not expose exact eval count in public API;
-        # count 1 base eval + 1 line search eval minimum (conservatively tracked).
         new_evals = state.num_evals + jnp.asarray(2, jnp.int32)
         new_state = BaselineState(
             opt_state=new_opt_state,

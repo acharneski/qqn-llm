@@ -144,6 +144,7 @@ class ModelBundle:
     num_params: int
     mesh: Mesh
     param_sharding: Any
+    init_param_dtype: Any = jnp.bfloat16
 
 
 def build_mesh(fsdp_axis_size: int) -> Mesh:
@@ -299,6 +300,7 @@ def build_model_and_params(
             num_params=count_params(params),
             mesh=mesh,
             param_sharding=param_sharding,
+            init_param_dtype=compute_dtype,
         )
 
     # Real Gemma 4 via google-deepmind/gemma
@@ -353,4 +355,5 @@ def build_model_and_params(
         num_params=count_params(params),
         mesh=mesh,
         param_sharding=param_sharding,
+        init_param_dtype=jnp.bfloat16,
     )

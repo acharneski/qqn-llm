@@ -34,14 +34,17 @@ def make_accumulated_loss_fn(
     forward_fn: Callable[[dict, jnp.ndarray], jnp.ndarray],
     l2_reg: float = 0.0,
     mesh: Optional[Mesh] = None,
+    anchor_params: Optional[dict] = None,
+    anchor_l2_reg: float = 0.0,
 ) -> Callable[[dict, dict[str, jnp.ndarray]], jnp.ndarray]:
     """Build a deterministic macro-batch loss using checkpointed ``jax.lax.scan``.
 
     Wrapping the micro-batch scan body with ``jax.checkpoint`` ensures JAX only
     retains 1 micro-batch of activations/logits during backward rather than
-    ``num_micro_batches`` copies. When ``mesh`` has ``fsdp > 1`` and the
-    micro-batch size is divisible by ``fsdp``, explicit sharding constraints
-    keep inputs and 262k-vocab logits sharded along the batch dimension.
+    ``num_micro_batches`` copies. When ``anchor_l2_reg > 0`` and ``anchor_params``
+    is provided, adds an L2-SP prior ``0.5 * anchor_l2_reg * ‖θ - θ₀‖₂²`` that
+    regularizes weights toward pretrained ``θ₀`` while keeping line searches and
+    L-BFGS secant pairs strictly objective-consistent.
     """
 
     def loss_fn(params, macro_batch: dict[str, jnp.ndarray]) -> jnp.ndarray:
@@ -78,6 +81,18 @@ def make_accumulated_loss_fn(
             leaves = jax.tree_util.tree_leaves(params)
             l2 = sum(jnp.sum(x.astype(jnp.float32) ** 2) for x in leaves)
             mean_loss = mean_loss + jnp.asarray(l2_reg, jnp.float32) * l2
+
+        if anchor_l2_reg > 0.0 and anchor_params is not None:
+            sq_diff = sum(
+                jnp.sum((p.astype(jnp.float32) - p0.astype(jnp.float32)) ** 2)
+                for p, p0 in zip(
+                    jax.tree_util.tree_leaves(params),
+                    jax.tree_util.tree_leaves(anchor_params),
+                )
+            )
+            mean_loss = (
+                mean_loss + jnp.asarray(0.5 * anchor_l2_reg, jnp.float32) * sq_diff
+            )
 
         return mean_loss
 

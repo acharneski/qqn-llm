@@ -17,11 +17,11 @@ data:
   micro_batch_size: 8           # 1 sequence per GPU across 8x A100/H100
   batch_mode: macro_batch       # Mode B: consistent macro-batch with refresh_state
   macro_batch_examples: 192     # 24 micro-batches per macro-batch
-  inner_steps_per_batch: 3      # 3 QQN steps per macro-batch (amortizes refresh_state)
+  inner_steps_per_batch: 2      # 2 QQN steps per macro-batch (prevents batch memorization)
 
 training:
   steps: 45
-  eval_every: 5
+  eval_every: 3
   checkpoint_every: 0
   l2_reg: 0.0
   fsdp_axis_size: 8
@@ -49,8 +49,13 @@ optimizers:
     kind: qqn
     oracle: lbfgs_adam
     learning_rate: 2.0e-5
+    beta2: 0.98
+    grad_clip_norm: 1.0
+    max_qn_gain: 4.0
+    anchor_weight_decay: 1.0e-3
     use_lr_schedule: true
     clear_lbfgs_on_refresh: true
+    tangent_mode: preconditioned
     history_size: 5
     line_search: backtracking
     c1: 1.0e-6
@@ -61,8 +66,13 @@ optimizers:
     kind: qqn
     oracle: lbfgs_adam
     learning_rate: 2.0e-5
+    beta2: 0.98
+    grad_clip_norm: 1.0
+    max_qn_gain: 4.0
+    anchor_weight_decay: 1.0e-3
     use_lr_schedule: true
     clear_lbfgs_on_refresh: true
+    tangent_mode: preconditioned
     history_size: 4
     line_search: backtracking
     path_strategy: spline

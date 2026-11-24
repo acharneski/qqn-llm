@@ -50,6 +50,31 @@ optimizers:
     history_size: 5
     line_search: strong_wolfe
     path_strategy: quadratic
+    tangent_mode: raw
+    c1: 1.0e-4
+    c2: 0.9
+    ls_max_iter: 4
+    max_t: 2.0
+  - name: lbfgs_adam_strong_wolfe_reparam
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-3
+    history_size: 5
+    line_search: strong_wolfe
+    path_strategy: quadratic
+    tangent_mode: reparam
+    c1: 1.0e-4
+    c2: 0.9
+    ls_max_iter: 4
+    max_t: 2.0
+  - name: lbfgs_adam_strong_wolfe_precond
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-3
+    history_size: 5
+    line_search: strong_wolfe
+    path_strategy: quadratic
+    tangent_mode: preconditioned
     c1: 1.0e-4
     c2: 0.9
     ls_max_iter: 4

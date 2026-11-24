@@ -44,6 +44,12 @@ const rows = files.map((file) => {
       : valSteps.length > 0
         ? Math.min(...valSteps.map((h) => h.val_loss))
         : NaN;
+  const bestRec = valSteps.reduce(
+    (best, h) => (!best || h.val_loss < best.val_loss ? h : best),
+    null
+  );
+  const bestStep = data.best_val_step ?? bestRec?.step ?? NaN;
+  const bestEvals = data.best_val_evals ?? bestRec?.num_evals ?? NaN;
   const steadySteps = hist.slice(1);
   const steadySec =
     typeof data.steady_train_seconds === "number"
@@ -68,6 +74,8 @@ const rows = files.map((file) => {
     initTrainLoss: data.init_train_loss ?? first.train_loss ?? NaN,
     finalTrainLoss: last.train_loss ?? NaN,
     bestValLoss: bestVal,
+    bestStep,
+    bestEvals,
     finalValLoss: lastVal ? lastVal.val_loss : NaN,
     bestValPpl: Number.isFinite(bestVal) ? Math.exp(Math.min(bestVal, 20)) : NaN,
     bestValL1: data.best_val_weight_l1_dist ?? NaN,
@@ -98,11 +106,11 @@ const mdLines = [
   "",
   `Parameters: **${(rows[0]?.paramsCount || 0).toLocaleString()}** | Optimizers compared: **${rows.length}** (sorted by Best Val Loss)`,
   "",
-  "| Optimizer | Steps | Evals | Init Train | Final Train | Best Val | Best PPL | Best ΔL1 | Best ΔL2 | Final ΔL1 | Final ΔL2 | Steady (s) | s/eval | Mean `t` | Accept % |",
-  "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+  "| Optimizer | Steps | Evals | Best @ (Step/Eval) | Init Train | Final Train | Best Val | Best PPL | Best ΔL1 | Best ΔL2 | Final ΔL1 | Final ΔL2 | Steady (s) | s/eval | Mean `t` | Accept % |",
+  "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
   ...rows.map(
     (r) =>
-      `| \`${r.name}\` | ${r.steps} | ${r.evals} | ${fmt(r.initTrainLoss)} | ${fmt(r.finalTrainLoss)} | **${fmt(r.bestValLoss)}** | ${fmt(r.bestValPpl, 2)} | ${fmtCompact(r.bestValL1)} | ${fmtCompact(r.bestValL2)} | ${fmtCompact(r.finalL1)} | ${fmtCompact(r.finalL2)} | ${fmt(r.steadySec, 1)} | ${fmt(r.secPerEval, 2)} | ${fmt(r.avgStepSize, 3)} | ${(r.acceptRate * 100).toFixed(0)}% |`
+      `| \`${r.name}\` | ${r.steps} | ${r.evals} | ${Number.isFinite(r.bestStep) ? `${r.bestStep}/${r.bestEvals}` : "—"} | ${fmt(r.initTrainLoss)} | ${fmt(r.finalTrainLoss)} | **${fmt(r.bestValLoss)}** | ${fmt(r.bestValPpl, 2)} | ${fmtCompact(r.bestValL1)} | ${fmtCompact(r.bestValL2)} | ${fmtCompact(r.finalL1)} | ${fmtCompact(r.finalL2)} | ${fmt(r.steadySec, 1)} | ${fmt(r.secPerEval, 2)} | ${fmt(r.avgStepSize, 3)} | ${(r.acceptRate * 100).toFixed(0)}% |`
   ),
   "",
 ];
@@ -118,6 +126,8 @@ const csvHeader = [
   "init_train_loss",
   "final_train_loss",
   "best_val_loss",
+  "best_val_step",
+  "best_val_evals",
   "best_val_ppl",
   "final_val_loss",
   "best_val_l1_dist",
@@ -139,6 +149,8 @@ const csvRows = rows.map((r) =>
     r.initTrainLoss,
     r.finalTrainLoss,
     r.bestValLoss,
+    r.bestStep,
+    r.bestEvals,
     r.bestValPpl,
     r.finalValLoss,
     r.bestValL1,

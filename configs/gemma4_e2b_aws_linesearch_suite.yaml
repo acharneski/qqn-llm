@@ -19,7 +19,7 @@ data:
 
 training:
   steps: 25
-  eval_every: 5
+  eval_every: 1
   checkpoint_every: 0
   l2_reg: 0.0
   fsdp_axis_size: 8
@@ -67,6 +67,50 @@ optimizers:
     history_size: 5
     line_search: strong_wolfe
     path_strategy: quadratic
+    tangent_mode: raw
+    c1: 1.0e-4
+    c2: 0.9
+    ls_max_iter: 4
+    max_t: 2.0
+    remember_step_size: true
+
+  # Interval-reparameterization & tangent-metric ablations vs canonical "raw" QQN
+  - name: lbfgs_adam_strong_wolfe_reparam
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: strong_wolfe
+    path_strategy: quadratic
+    tangent_mode: reparam        # Exact canonical path locus, Möbius-reparameterized s in [0, 1]
+    c1: 1.0e-4
+    c2: 0.9
+    ls_max_iter: 4
+    max_t: 2.0
+    remember_step_size: true
+
+  - name: lbfgs_adam_strong_wolfe_scaled
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: strong_wolfe
+    path_strategy: quadratic
+    tangent_mode: scaled         # Norm-matched Euclidean tangent (-τ∇f)
+    c1: 1.0e-4
+    c2: 0.9
+    ls_max_iter: 4
+    max_t: 2.0
+    remember_step_size: true
+
+  - name: lbfgs_adam_strong_wolfe_precond
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: strong_wolfe
+    path_strategy: quadratic
+    tangent_mode: preconditioned # Diagonally preconditioned tangent (-H0∇f)
     c1: 1.0e-4
     c2: 0.9
     ls_max_iter: 4
