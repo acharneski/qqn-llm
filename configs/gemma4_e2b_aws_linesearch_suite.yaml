@@ -1,0 +1,135 @@
+experiment_name: gemma4_e2b_aws_linesearch_suite
+output_dir: runs/gemma4_e2b_aws_linesearch_suite
+seed: 42
+
+model:
+  variant: gemma4_e2b
+  checkpoint: gemma4_e2b_it
+  dtype: bfloat16
+  master_dtype: float32
+  remat: true
+
+data:
+  source: gsm8k
+  seq_len: 512
+  train_examples: 192
+  val_examples: 64
+  micro_batch_size: 8
+  batch_mode: fixed_subset
+
+training:
+  steps: 25
+  eval_every: 5
+  checkpoint_every: 0
+  l2_reg: 0.0
+  fsdp_axis_size: 8
+  stop_on_train_loss: 1.0e-3
+  stop_on_consecutive_stalls: 2
+
+optimizers:
+  # Baseline
+  - name: adamw_2e-5
+    kind: adamw
+    learning_rate: 2.0e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    grad_clip_norm: 1.0
+
+  # L-BFGS-Adam line search & path matrix
+  - name: lbfgs_adam_armijo_t1
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: backtracking
+    path_strategy: quadratic
+    c1: 1.0e-6
+    ls_max_iter: 4
+    max_t: 1.0
+    remember_step_size: true
+
+  - name: lbfgs_adam_armijo_extrap
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: backtracking
+    path_strategy: quadratic
+    c1: 1.0e-6
+    ls_max_iter: 4
+    max_t: 2.0
+    remember_step_size: true
+
+  - name: lbfgs_adam_strong_wolfe
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: strong_wolfe
+    path_strategy: quadratic
+    c1: 1.0e-4
+    c2: 0.9
+    ls_max_iter: 4
+    max_t: 2.0
+    remember_step_size: true
+
+  - name: lbfgs_adam_bounded_spline
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: backtracking
+    path_strategy: spline
+    c1: 1.0e-6
+    ls_max_iter: 3
+    max_t: 2.0
+    spline_refine_rounds: 2
+    spline_max_control_points: 8
+    remember_step_size: true
+
+  - name: lbfgs_adam_linear_chord
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: backtracking
+    path_strategy: linear
+    c1: 1.0e-6
+    ls_max_iter: 4
+    max_t: 1.0
+    remember_step_size: true
+
+  - name: lbfgs_adam_null_search
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: "null"
+    path_strategy: quadratic
+    max_t: 1.0
+    remember_step_size: false
+
+  # QQN-Adam path/search comparison
+  - name: qqn_adam_armijo_t1
+    kind: qqn
+    oracle: adam
+    learning_rate: 2.0e-5
+    line_search: backtracking
+    path_strategy: quadratic
+    c1: 1.0e-6
+    ls_max_iter: 4
+    max_t: 1.0
+    remember_step_size: true
+
+  - name: qqn_adam_bounded_spline
+    kind: qqn
+    oracle: adam
+    learning_rate: 2.0e-5
+    line_search: backtracking
+    path_strategy: spline
+    c1: 1.0e-6
+    ls_max_iter: 3
+    max_t: 2.0
+    spline_refine_rounds: 2
+    spline_max_control_points: 8
+    remember_step_size: true

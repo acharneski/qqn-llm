@@ -1,0 +1,55 @@
+experiment_name: gemma4_e2b_aws_g6e
+output_dir: runs/gemma4_e2b_aws_g6e
+seed: 42
+
+model:
+  variant: gemma4_e2b
+  checkpoint: gemma4_e2b_it
+  dtype: bfloat16
+  remat: true
+
+data:
+  source: gsm8k
+  seq_len: 512
+  train_examples: 64
+  val_examples: 32
+  micro_batch_size: 4  # 1 sequence per GPU across 4x L40S
+  batch_mode: fixed_subset
+
+training:
+  steps: 25
+  eval_every: 5
+  checkpoint_every: 0  # Phase 1: efficacy telemetry only (set >0 in Phase 2 to save Orbax weights)
+  l2_reg: 0.0
+  fsdp_axis_size: 4  # g6e.12xlarge (4x L40S, 192 GB)
+
+optimizers:
+  - name: adamw_2e-5
+    kind: adamw
+    learning_rate: 2.0e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    grad_clip_norm: 1.0
+  - name: qqn_secant
+    kind: qqn
+    oracle: secant
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 5
+    remember_step_size: true
+  - name: qqn_adam_2e-5
+    kind: qqn
+    oracle: adam
+    learning_rate: 2.0e-5
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 5
+    remember_step_size: true
+  - name: qqn_lbfgs_m5
+    kind: qqn
+    oracle: lbfgs
+    history_size: 5
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 5
+    remember_step_size: true

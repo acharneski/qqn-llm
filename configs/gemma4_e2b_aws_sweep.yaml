@@ -1,0 +1,69 @@
+experiment_name: gemma4_e2b_aws_sweep
+output_dir: runs/gemma4_e2b_aws_sweep
+seed: 42
+
+model:
+  variant: gemma4_e2b
+  checkpoint: gemma4_e2b_it
+  dtype: bfloat16         # Fast bf16 forward/backward compute
+  master_dtype: float32   # fp32 master weights (prevents bf16 update underflow & preserves exact L-BFGS curvature)
+  remat: true
+
+data:
+  source: gsm8k
+  seq_len: 512
+  train_examples: 192     # Fixed subset (24 micro-batches)
+  val_examples: 64
+  micro_batch_size: 8     # 1 sequence per GPU across 8x A100/H100
+  batch_mode: fixed_subset
+
+training:
+  steps: 30
+  eval_every: 5
+  checkpoint_every: 0     # Phase 1: efficacy telemetry only
+  l2_reg: 0.0
+  fsdp_axis_size: 8
+  stop_on_train_loss: 1.0e-3
+  stop_on_consecutive_stalls: 2
+
+optimizers:
+  - name: adamw_2e-5
+    kind: adamw
+    learning_rate: 2.0e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    grad_clip_norm: 1.0
+  - name: adamw_5e-5
+    kind: adamw
+    learning_rate: 5.0e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    grad_clip_norm: 1.0
+  - name: qqn_adam_2e-5
+    kind: qqn
+    oracle: adam
+    learning_rate: 2.0e-5
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 4
+    max_t: 1.0
+    remember_step_size: true
+  - name: qqn_lbfgs_adam_m5
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 4
+    max_t: 1.0
+    remember_step_size: true
+  - name: qqn_lbfgs_m5
+    kind: qqn
+    oracle: lbfgs
+    history_size: 5
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 4
+    max_t: 10.0
+    remember_step_size: true

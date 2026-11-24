@@ -1,0 +1,66 @@
+experiment_name: smoke_local
+output_dir: runs/smoke_local
+seed: 42
+
+model:
+  variant: tiny_smoke
+  dtype: bfloat16
+  master_dtype: float32
+  remat: false
+  # Tiny Gemma-4-structured config for fast RTX 2080 (8GB) smoke testing
+  tiny_num_layers: 2
+  tiny_embed_dim: 256
+  tiny_hidden_dim: 512
+  tiny_num_heads: 4
+  tiny_num_kv_heads: 2
+  tiny_head_dim: 64
+  tiny_vocab_size: 2048
+
+data:
+  source: synthetic
+  seq_len: 128
+  train_examples: 32
+  val_examples: 16
+  micro_batch_size: 8
+  batch_mode: fixed_subset  # Mode A: deterministic full-subset accumulation
+
+training:
+  steps: 15
+  eval_every: 5
+  checkpoint_every: 15
+  l2_reg: 0.0
+  fsdp_axis_size: 1
+
+optimizers:
+  - name: adamw_2e-3
+    kind: adamw
+    learning_rate: 2.0e-3
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    grad_clip_norm: 1.0
+  - name: qqn_lbfgs_m5
+    kind: qqn
+    oracle: lbfgs
+    history_size: 5
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 5
+    remember_step_size: true
+  - name: qqn_lbfgs_adam_m5
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-3
+    history_size: 5
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 5
+    max_t: 2.0
+    remember_step_size: true
+  - name: qqn_adam_2e-3
+    kind: qqn
+    oracle: adam
+    learning_rate: 2.0e-3
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 5
+    remember_step_size: true

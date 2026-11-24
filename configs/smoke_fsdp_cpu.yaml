@@ -1,0 +1,40 @@
+experiment_name: smoke_fsdp_cpu
+output_dir: runs/smoke_fsdp_cpu
+seed: 42
+
+model:
+  variant: tiny_smoke
+  dtype: float32
+  remat: false
+  tiny_num_layers: 2
+  tiny_embed_dim: 128
+  tiny_hidden_dim: 256
+  tiny_num_heads: 4
+  tiny_num_kv_heads: 2
+  tiny_head_dim: 32
+  tiny_vocab_size: 512
+
+data:
+  source: synthetic
+  seq_len: 64
+  train_examples: 16
+  val_examples: 8
+  micro_batch_size: 4
+  batch_mode: fixed_subset
+
+training:
+  steps: 6
+  eval_every: 3
+  checkpoint_every: 0
+  l2_reg: 0.0
+  fsdp_axis_size: 4
+
+optimizers:
+  - name: qqn_lbfgs_m4
+    kind: qqn
+    oracle: lbfgs
+    history_size: 4
+    line_search: backtracking
+    c1: 1.0e-6
+    ls_max_iter: 4
+    remember_step_size: true

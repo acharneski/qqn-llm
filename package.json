@@ -1,0 +1,20 @@
+{
+  "name": "qqn-llm-ops",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js CLI tooling for AWS EC2 orchestration and experiment reporting for qqn-llm",
+  "scripts": {
+    "aws:launch": "node infra/aws/launch.mjs launch",
+    "aws:status": "node infra/aws/launch.mjs status",
+    "aws:tail": "node infra/aws/launch.mjs tail",
+    "aws:logs": "node infra/aws/launch.mjs logs",
+    "aws:pull": "node infra/aws/launch.mjs pull",
+    "aws:terminate": "node infra/aws/launch.mjs terminate",
+    "aws:cost": "node infra/aws/launch.mjs cost",
+    "report": "node scripts/report.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

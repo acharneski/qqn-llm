@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qqn-llm"
+version = "0.1.0"
+description = "Full-weight Gemma 4 fine-tuning experiments integrating qqn-jax"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "jax>=0.5",
+    "flax>=0.10",
+    "optax>=0.2.4",
+    "orbax-checkpoint>=0.11",
+    "gemma",
+    "protobuf>=7.36.1",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "datasets>=2.19",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "jax[cuda12]>=0.5",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+qqn-llm-train = "qqn_llm.train:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qqn_llm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
