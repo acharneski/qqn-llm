@@ -315,3 +315,32 @@ def test_device_weight_deviation_matches_exact_f64_and_terminal_batch_saves_eval
     assert st_next.num_evals == 1
     assert metrics["ls_success"] == 1.0
     assert float(quad(p_next, None)) < float(quad(cur_p, None))
+
+
+def test_l2sp_runtime_anchor_tuple_has_zero_closed_over_jaxpr_consts():
+    """Passing (batch, anchor) avoids closed-over MLIR constant duplication of anchor_params."""
+    from qqn_llm.loss import make_accumulated_loss_fn
+
+    def dummy_fwd(p, inp):
+        return jnp.broadcast_to(p["w"][:8], inp.shape + (8,))
+
+    anchor = {"w": jnp.ones((1024,), dtype=jnp.bfloat16)}
+    params = {"w": jnp.full((1024,), 2.0, dtype=jnp.float32)}
+    batch = {
+        "input_ids": jnp.zeros((2, 4, 8), dtype=jnp.int32),
+        "target_ids": jnp.zeros((2, 4, 8), dtype=jnp.int32),
+        "loss_mask": jnp.ones((2, 4, 8), dtype=jnp.float32),
+    }
+
+    loss_fn = make_accumulated_loss_fn(
+        dummy_fwd, l2_reg=0.0, anchor_params=None, anchor_l2_reg=0.1
+    )
+    jaxpr = jax.make_jaxpr(jax.value_and_grad(loss_fn))(params, (batch, anchor))
+    # Zero closed-over large array constants in jaxpr!
+    assert all(np.size(c) < 16 for c in jaxpr.consts)
+
+    val, grad = jax.jit(jax.value_and_grad(loss_fn))(params, (batch, anchor))
+    loss_no_anchor = make_accumulated_loss_fn(dummy_fwd, l2_reg=0.0)(params, batch)
+    expected_reg = 0.5 * 0.1 * 1024.0 * (2.0 - 1.0) ** 2
+    assert np.isclose(float(val - loss_no_anchor), expected_reg, rtol=1e-5)
+    assert np.allclose(grad["w"][8:], 0.1 * (2.0 - 1.0), rtol=1e-5)

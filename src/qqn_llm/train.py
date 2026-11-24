@@ -203,19 +203,16 @@ def run_single_optimizer(
     base_train_loss_fn,
     eval_loss_jit,
     sharded_val_batch: dict[str, jnp.ndarray],
-    sharded_anchor_params,
-    deviation_fn,
-    master_dtype,
 ) -> dict[str, Any]:
     """Run one optimizer configuration (single- or multi-phase) and write JSON telemetry."""
     phases = _resolve_phases(exp_cfg, opt_cfg)
     total_planned_steps = sum(p.steps for p in phases)
 
-    print(f"[{opt_cfg.name}] Initializing master parameters on FSDP mesh...", flush=True)
-    params = jax.jit(
-        lambda p0: jax.tree_util.tree_map(lambda x: x.astype(master_dtype), p0),
-        out_shardings=bundle.param_sharding,
-    )(sharded_anchor_params)
+    print(f"[{opt_cfg.name}] Placing initial parameters onto FSDP mesh...", flush=True)
+    params = jax.device_put(
+        jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), bundle.params),
+        bundle.param_sharding,
+    )
 
     init_val = float(eval_loss_jit(params, sharded_val_batch))
     init_train_loss: float | None = None
@@ -241,16 +238,33 @@ def run_single_optimizer(
 
     for phase_idx, phase in enumerate(phases):
         phase_opt_cfg = _phase_to_opt_cfg(opt_cfg.name, phase)
+        # Only materialize a GPU copy of initial weights when L2-SP anchor regularization
+        # is explicitly requested for this phase (keeps 1.14 GiB/GPU free otherwise).
+        # Pass `sharded_anchor_params` as an explicit traced tuple input `(batch, anchor)`
+        # rather than closing over it inside `loss_fn` so MLIR never embeds 9.3 GB of
+        # weights as an inlined compile-time constant!
+        sharded_anchor_params = None
         if phase.anchor_weight_decay > 0.0:
+            sharded_anchor_params = jax.device_put(
+                jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), bundle.params),
+                bundle.param_sharding,
+            )
             phase_loss_fn = make_accumulated_loss_fn(
                 bundle.forward_fn,
                 l2_reg=exp_cfg.training.l2_reg,
                 mesh=bundle.mesh,
-                anchor_params=sharded_anchor_params,
+                anchor_params=None,
                 anchor_l2_reg=phase.anchor_weight_decay,
             )
         else:
             phase_loss_fn = base_train_loss_fn
+
+        def _wrap_phase_batch(sharded_b):
+            return (
+                (sharded_b, sharded_anchor_params)
+                if sharded_anchor_params is not None
+                else sharded_b
+            )
 
         runner = _make_runner(
             phase_loss_fn, phase_opt_cfg, total_steps=phase.steps, bundle=bundle
@@ -258,7 +272,7 @@ def run_single_optimizer(
         host_stepped = bool(getattr(runner, "is_host_stepped", False))
 
         if exp_cfg.data.batch_mode == "fixed_subset" and not opt_cfg.phases:
-            first_batch = _shard_batch(data.fixed_train_batch, bundle)
+            raw_first_batch = _shard_batch(data.fixed_train_batch, bundle)
             batch_iter = None
         else:
             batch_iter = data.macro_batch_iterator(
@@ -266,7 +280,8 @@ def run_single_optimizer(
                 macro_batch_examples=phase.macro_batch_examples,
                 seed_offset=phase_idx * 1000,
             )
-            first_batch = _shard_batch(next(batch_iter), bundle)
+            raw_first_batch = _shard_batch(next(batch_iter), bundle)
+        first_batch = _wrap_phase_batch(raw_first_batch)
 
         if host_stepped:
             init_fn = runner.init
@@ -303,7 +318,7 @@ def run_single_optimizer(
         print(
             f"[{phase_tag}] Compiling & running init (kind={phase.kind}, "
             f"oracle={phase.oracle if phase.kind == 'qqn' else '-'}, "
-            f"batch shape={first_batch['input_ids'].shape}, inner={phase.inner_steps_per_batch}{warm_note})...",
+            f"batch shape={raw_first_batch['input_ids'].shape}, inner={phase.inner_steps_per_batch}{warm_note})...",
             flush=True,
         )
         if host_stepped:
@@ -326,8 +341,9 @@ def run_single_optimizer(
             flush=True,
         )
 
-        tokens_per_batch = int(jnp.sum(first_batch["loss_mask"]))
+        tokens_per_batch = int(jnp.sum(raw_first_batch["loss_mask"]))
         current_batch = first_batch
+        del raw_first_batch, first_batch
         prev_phase_evals = int(state.num_evals)
         cum_evals += prev_phase_evals
         cum_tokens += prev_phase_evals * tokens_per_batch
@@ -342,8 +358,10 @@ def run_single_optimizer(
                 and local_step > 1
                 and (local_step - 1) % inner_k == 0
             ):
-                current_batch = _shard_batch(next(batch_iter), bundle)
-                tokens_per_batch = int(jnp.sum(current_batch["loss_mask"]))
+                raw_next_batch = _shard_batch(next(batch_iter), bundle)
+                tokens_per_batch = int(jnp.sum(raw_next_batch["loss_mask"]))
+                current_batch = _wrap_phase_batch(raw_next_batch)
+                del raw_next_batch
                 state = refresh_fn(params, state, current_batch)
                 if not host_stepped:
                     jax.block_until_ready(state)
@@ -417,7 +435,7 @@ def run_single_optimizer(
                 or should_stop
             ):
                 val_loss = float(eval_loss_jit(params, sharded_val_batch))
-                dev = deviation_fn(params)
+                dev = _compute_weight_deviation(params, bundle.params)
                 final_dev = dev
                 rec["val_loss"] = val_loss
                 rec["val_ppl"] = float(math.exp(min(val_loss, 20.0)))
@@ -492,7 +510,7 @@ def run_single_optimizer(
             and hasattr(runner, "export_preconditioner")
         ):
             carry_precond = runner.export_preconditioner(state)
-        del state, runner
+        del state, runner, sharded_anchor_params
         gc.collect()
 
     del carry_precond
@@ -560,8 +578,6 @@ def run_experiment(
     exp_cfg: ExperimentConfig, output_dir: str | Path | None = None
 ) -> list[dict[str, Any]]:
     """Run all optimizers configured in ``exp_cfg``."""
-    from qqn_llm.model import resolve_dtype
-
     out_path = Path(output_dir or exp_cfg.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -577,17 +593,6 @@ def run_experiment(
     )
     print(f"[qqn-llm] Loaded {bundle.num_params:,} trainable parameters.", flush=True)
     data = load_dataset_bundle(exp_cfg.data, bundle.vocab_size, exp_cfg.seed)
-
-    master_dtype = resolve_dtype(exp_cfg.model.master_dtype)
-    sharded_anchor_params = jax.device_put(
-        jax.tree_util.tree_map(
-            lambda x: jnp.asarray(x, dtype=bundle.init_param_dtype), bundle.params
-        ),
-        bundle.param_sharding,
-    )
-    deviation_fn = _make_device_weight_deviation_fn(
-        sharded_anchor_params, bundle.mesh, bundle.num_params
-    )
 
     base_train_loss_fn = make_accumulated_loss_fn(
         bundle.forward_fn, l2_reg=exp_cfg.training.l2_reg, mesh=bundle.mesh
@@ -612,14 +617,13 @@ def run_experiment(
                 base_train_loss_fn=base_train_loss_fn,
                 eval_loss_jit=eval_loss_jit,
                 sharded_val_batch=sharded_val_batch,
-                sharded_anchor_params=sharded_anchor_params,
-                deviation_fn=deviation_fn,
-                master_dtype=master_dtype,
             )
             results.append(res)
         except Exception as exc:
             print(f"[{opt_cfg.name}] FAILED: {exc}", flush=True)
             traceback.print_exc()
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
         finally:
             gc.collect()
             jax.clear_caches()

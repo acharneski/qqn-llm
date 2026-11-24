@@ -43,6 +43,7 @@ optimizers:
         macro_batch_examples: 16
         inner_steps_per_batch: 1
         learning_rate: 2.0e-3
+        grad_clip_norm: 1.0
       - name: polish_intensive
         kind: adamw
         steps: 4
@@ -51,6 +52,7 @@ optimizers:
         learning_rate: 1.0e-3
         warmup_ratio: 0.0
         warm_start_preconditioner: true
+        grad_clip_norm: 1.0
 
   - name: two_phase_adamw_to_lbfgs_adam
     kind: qqn
@@ -61,6 +63,7 @@ optimizers:
         macro_batch_examples: 16
         inner_steps_per_batch: 1
         learning_rate: 2.0e-3
+        grad_clip_norm: 1.0
       - name: polish_lbfgs_adam_sw
         kind: qqn
         oracle: lbfgs_adam
@@ -90,6 +93,8 @@ optimizers:
         tangent_mode: preconditioned
         max_t: 1.0
         learning_rate: 2.0e-3
+        beta2: 0.98
+        grad_clip_norm: 1.0
         use_lr_schedule: true
         steps: 6
         macro_batch_examples: 16

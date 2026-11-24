@@ -79,13 +79,13 @@ class PhaseConfig:
     clear_lbfgs_on_refresh: bool = True
     tangent_mode: Literal["raw", "reparam", "scaled", "preconditioned"] = "raw"
     warm_start_preconditioner: bool = True
-    beta2: float = 0.98
-    max_qn_gain: float = 4.0
+    beta2: float = 0.999
+    max_qn_gain: float = 0.0
     anchor_weight_decay: float = 0.0
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 0.0
 
 
 @dataclass
@@ -107,14 +107,14 @@ class OptimizerConfig:
     spline_max_control_points: int = 8
     use_lr_schedule: bool = False
     clear_lbfgs_on_refresh: bool = True
-    beta2: float = 0.98
-    max_qn_gain: float = 4.0
+    beta2: float = 0.999
+    max_qn_gain: float = 0.0
     anchor_weight_decay: float = 0.0
     # AdamW / AdamOracle options
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 0.0
     # Optional multi-phase schedule (overrides single-phase optimizer settings when non-empty)
     phases: list[PhaseConfig] = field(default_factory=list)
 

@@ -49,10 +49,7 @@ optimizers:
     kind: qqn
     oracle: lbfgs_adam
     learning_rate: 2.0e-5
-    beta2: 0.98
-    grad_clip_norm: 1.0
     max_qn_gain: 4.0
-    anchor_weight_decay: 1.0e-3
     use_lr_schedule: true
     clear_lbfgs_on_refresh: true
     tangent_mode: preconditioned
@@ -66,10 +63,7 @@ optimizers:
     kind: qqn
     oracle: lbfgs_adam
     learning_rate: 2.0e-5
-    beta2: 0.98
-    grad_clip_norm: 1.0
     max_qn_gain: 4.0
-    anchor_weight_decay: 1.0e-3
     use_lr_schedule: true
     clear_lbfgs_on_refresh: true
     tangent_mode: preconditioned

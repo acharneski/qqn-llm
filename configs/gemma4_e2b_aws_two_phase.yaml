@@ -84,7 +84,7 @@ optimizers:
       - name: polish_lbfgs_adam_sw
         kind: qqn
         oracle: lbfgs_adam
-        history_size: 5
+        history_size: 4
         line_search: strong_wolfe
         path_strategy: quadratic
         tangent_mode: preconditioned
@@ -94,8 +94,6 @@ optimizers:
         ls_max_iter: 4
         max_t: 2.0
         learning_rate: 1.0e-5
-        beta2: 0.98
-        grad_clip_norm: 1.0
         max_qn_gain: 4.0
         anchor_weight_decay: 1.0e-3
         use_lr_schedule: true
@@ -127,7 +125,7 @@ optimizers:
       - name: polish_lbfgs_adam_sw
         kind: qqn
         oracle: lbfgs_adam
-        history_size: 5
+        history_size: 4
         line_search: strong_wolfe
         path_strategy: quadratic
         tangent_mode: preconditioned
@@ -137,8 +135,6 @@ optimizers:
         ls_max_iter: 4
         max_t: 2.0
         learning_rate: 1.0e-5
-        beta2: 0.98
-        grad_clip_norm: 1.0
         max_qn_gain: 4.0
         anchor_weight_decay: 1.0e-3
         use_lr_schedule: true

@@ -47,11 +47,16 @@ def make_accumulated_loss_fn(
     L-BFGS secant pairs strictly objective-consistent.
     """
 
-    def loss_fn(params, macro_batch: dict[str, jnp.ndarray]) -> jnp.ndarray:
+    def loss_fn(params, macro_batch: dict[str, jnp.ndarray] | tuple) -> jnp.ndarray:
+        if isinstance(macro_batch, tuple):
+            scan_batch, runtime_anchor = macro_batch
+        else:
+            scan_batch, runtime_anchor = macro_batch, anchor_params
+
         use_batch_shard = (
             mesh is not None
             and mesh.shape["fsdp"] > 1
-            and macro_batch["input_ids"].shape[1] % mesh.shape["fsdp"] == 0
+            and scan_batch["input_ids"].shape[1] % mesh.shape["fsdp"] == 0
         )
 
         @jax.checkpoint
@@ -74,7 +79,7 @@ def make_accumulated_loss_fn(
             return (acc_loss + mb_loss, acc_tokens + mb_tokens), None
 
         init_carry = (jnp.asarray(0.0, jnp.float32), jnp.asarray(0.0, jnp.float32))
-        (total_loss, total_tokens), _ = jax.lax.scan(body, init_carry, macro_batch)
+        (total_loss, total_tokens), _ = jax.lax.scan(body, init_carry, scan_batch)
         mean_loss = total_loss / jnp.maximum(total_tokens, jnp.asarray(1.0, jnp.float32))
 
         if l2_reg > 0.0:
@@ -82,12 +87,12 @@ def make_accumulated_loss_fn(
             l2 = sum(jnp.sum(x.astype(jnp.float32) ** 2) for x in leaves)
             mean_loss = mean_loss + jnp.asarray(l2_reg, jnp.float32) * l2
 
-        if anchor_l2_reg > 0.0 and anchor_params is not None:
+        if anchor_l2_reg > 0.0 and runtime_anchor is not None:
             sq_diff = sum(
                 jnp.sum((p.astype(jnp.float32) - p0.astype(jnp.float32)) ** 2)
                 for p, p0 in zip(
                     jax.tree_util.tree_leaves(params),
-                    jax.tree_util.tree_leaves(anchor_params),
+                    jax.tree_util.tree_leaves(runtime_anchor),
                 )
             )
             mean_loss = (

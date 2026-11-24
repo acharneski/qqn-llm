@@ -230,14 +230,21 @@ class QQNRunner:
         t_mode = self.tangent_mode
         is_linear = self.path_strategy == "linear"
 
-        # 1. Shared compiled value_and_grad + forward-only loss (for terminal batch probes)
+        # 1. Shared compiled value_and_grad + forward-only loss (donate candidate input
+        #    so its 2.17 GiB/GPU FSDP buffer is recycled in-place before jit_loss_fn's
+        #    6.80 GiB workspace allocates)
         self._vg_jit = jax.jit(
             jax.value_and_grad(loss_fn),
             out_shardings=(self.replicated, param_sharding),
+            donate_argnums=(0,),
         )
         self._loss_jit = jax.jit(
             loss_fn,
             out_shardings=self.replicated,
+        )
+        self._clone_params_jit = jax.jit(
+            lambda p: jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), p),
+            out_shardings=param_sharding,
         )
 
         # Helper mapping s -> (t(s), dt/ds) for Möbius interval reparameterization
@@ -386,13 +393,19 @@ class QQNRunner:
             beta_i = rho_i * tree_vdot(y_i, r, accum_dtype=jnp.float32)
             return tree_add_scaled(r, alpha_i - beta_i, s_i)
 
-        self._loop1_step_jit = jax.jit(
+        self._loop1_first_jit = jax.jit(
             _loop1_step_fn,
             out_shardings=(param_sharding, self.replicated),
+        )
+        self._loop1_donate_jit = jax.jit(
+            _loop1_step_fn,
+            out_shardings=(param_sharding, self.replicated),
+            donate_argnums=(0,),
         )
         self._loop2_step_jit = jax.jit(
             _loop2_step_fn,
             out_shardings=param_sharding,
+            donate_argnums=(0,),
         )
 
         def _clip_scale_fn(grad):
@@ -464,10 +477,12 @@ class QQNRunner:
         self._apply_adam_h0_jit = jax.jit(
             _apply_adam_h0_fn,
             out_shardings=param_sharding,
+            donate_argnums=(0,),
         )
         self._finalize_lbfgs_dir_jit = jax.jit(
             _finalize_lbfgs_dir_fn,
             out_shardings=(param_sharding, param_sharding),
+            donate_argnums=(0,),
         )
 
         self._scale_jit = jax.jit(
@@ -601,8 +616,9 @@ class QQNRunner:
 
             q = grad
             alphas = []
-            for s_i, y_i, rho_arr in state.pairs:
-                q, alpha_i = self._loop1_step_jit(q, s_i, y_i, rho_arr)
+            for idx, (s_i, y_i, rho_arr) in enumerate(state.pairs):
+                step_l1 = self._loop1_first_jit if idx == 0 else self._loop1_donate_jit
+                q, alpha_i = step_l1(q, s_i, y_i, rho_arr)
                 alphas.append(alpha_i)
 
             r = self._apply_adam_h0_jit(q, v_next, step_t, base_lr_arr, c_k)
@@ -629,11 +645,13 @@ class QQNRunner:
 
         q = grad
         alphas = []
-        for s_i, y_i, rho_arr in state.pairs:
-            q, alpha_i = self._loop1_step_jit(q, s_i, y_i, rho_arr)
+        for idx, (s_i, y_i, rho_arr) in enumerate(state.pairs):
+            step_l1 = self._loop1_first_jit if idx == 0 else self._loop1_donate_jit
+            q, alpha_i = step_l1(q, s_i, y_i, rho_arr)
             alphas.append(alpha_i)
 
         r = self._scale_jit(jnp.asarray(state.gamma, jnp.float32), q)
+        del q
         for (s_i, y_i, rho_arr), alpha_i in zip(
             reversed(state.pairs), reversed(alphas)
         ):
@@ -687,7 +705,7 @@ class QQNRunner:
         warm_precond: tuple[Any, int] | None = None,
     ) -> HostQQNState:
         self._ensure_oracle_jits(params)
-        val, grad = self._vg_jit(params, macro_batch)
+        val, grad = self._vg_jit(self._clone_params_jit(params), macro_batch)
         if self.use_sharded_lbfgs:
             if self.use_adam_precond:
                 if warm_precond is not None and warm_precond[0] is not None:
@@ -742,7 +760,7 @@ class QQNRunner:
         return None
 
     def refresh(self, params, state: HostQQNState, macro_batch) -> HostQQNState:
-        val, grad = self._vg_jit(params, macro_batch)
+        val, grad = self._vg_jit(self._clone_params_jit(params), macro_batch)
         _, gnorm = self._finite_and_norm_jit(grad)
         if self.use_sharded_lbfgs and self.cfg.clear_lbfgs_on_refresh:
             state.oracle_state.pairs.clear()
@@ -826,17 +844,37 @@ class QQNRunner:
         evals = 0
         control_points: list[tuple[float, float, float]] = [(0.0, state.value, slope0)]
 
+        def _offload_grad(g_tree):
+            """Move retained `best_g` off GPU before a subsequent probe runs (-2.17 GiB/GPU)."""
+            if g_tree is None or g_tree is grad:
+                return g_tree
+            leaves = jax.tree_util.tree_leaves(g_tree)
+            if leaves and isinstance(leaves[0], jax.Array):
+                return jax.device_get(g_tree)
+            return g_tree
+
+        def _restore_grad(g_tree):
+            """Ensure winning `best_g` is back on FSDP mesh after line search frees temporaries."""
+            if g_tree is None or g_tree is grad:
+                return g_tree
+            leaves = jax.tree_util.tree_leaves(g_tree)
+            if leaves and not isinstance(leaves[0], jax.Array):
+                return jax.device_put(g_tree, self.param_sharding)
+            return g_tree
+
         def eval_t(t_val: float, *, value_only: bool = False):
             nonlocal evals
             t_arr = jnp.asarray(t_val, jnp.float32)
             cand = self._candidate_jit(params, g_ref, qn_dir, t_arr, tau_arr)
             if value_only:
                 v_arr = self._loss_jit(cand, macro_batch)
+                del cand
                 evals += 1
                 v = float(v_arr)
                 ok = math.isfinite(v)
-                return cand, v, grad, ok, state.error, 0.0
+                return v, grad, ok, state.error, 0.0
             v_arr, g_arr = self._vg_jit(cand, macro_batch)
+            del cand
             evals += 1
             v = float(v_arr)
             g_ok, g_norm, slope_arr = self._post_eval_jit(
@@ -846,9 +884,11 @@ class QQNRunner:
             slope_t = float(slope_arr) if (need_slope and ok) else 0.0
             if ok and need_slope:
                 control_points.append((t_val, v, slope_t))
-            return cand, v, g_arr, ok, float(g_norm), slope_t
+            return v, g_arr, ok, float(g_norm), slope_t
 
-        # --- Inner line search ---
+        # --- Inner line search (donates `cand` into `_vg_jit`, offloads `best_g` across
+        #     multi-probe steps, and materializes `best_p` once at the end in <1 ms) ---
+        best_p = None
         if self.line_search in ("null", "fixed"):
             best_t = min(1.0, max_step)
             if grad_unused_after_step:
@@ -862,16 +902,15 @@ class QQNRunner:
                 )
                 accepted = True
             else:
-                best_p, best_v, best_g, best_ok, best_gnorm, _ = eval_t(best_t)
+                best_v, best_g, best_ok, best_gnorm, _ = eval_t(best_t)
                 accepted = best_ok
         elif self.line_search == "strong_wolfe":
             lo_t, lo_v = 0.0, state.value
             hi_t: float | None = None
             cur_t = init_step
-            cur_p, cur_v, cur_g, cur_ok, cur_gnorm, cur_m = eval_t(cur_t)
-            best_t, best_p, best_v, best_g, best_ok, best_gnorm = (
+            cur_v, cur_g, cur_ok, cur_gnorm, cur_m = eval_t(cur_t)
+            best_t, best_v, best_g, best_ok, best_gnorm = (
                 cur_t,
-                cur_p,
                 cur_v,
                 cur_g,
                 cur_ok,
@@ -882,11 +921,10 @@ class QQNRunner:
                 armijo = cur_ok and (cur_v <= state.value + c1 * cur_t * slope0)
                 curv = cur_ok and (abs(cur_m) <= c2 * abs(slope0))
                 if armijo and curv:
-                    if cur_p is not best_p:
-                        del best_p, best_g
-                        best_t, best_p, best_v, best_g, best_ok, best_gnorm = (
+                    if cur_g is not best_g:
+                        del best_g
+                        best_t, best_v, best_g, best_ok, best_gnorm = (
                             cur_t,
-                            cur_p,
                             cur_v,
                             cur_g,
                             cur_ok,
@@ -902,8 +940,8 @@ class QQNRunner:
                     else:
                         lo_t, lo_v = cur_t, cur_v
                 if ls_i == max_iter:
-                    if cur_p is not best_p:
-                        del cur_p, cur_g
+                    if cur_g is not best_g:
+                        del cur_g
                     accepted = best_ok and (
                         best_v <= state.value + c1 * best_t * slope0
                     )
@@ -913,18 +951,18 @@ class QQNRunner:
                 else:
                     t_next = min(cur_t * grow, max_step)
                     if abs(t_next - cur_t) < 1e-7:
-                        if cur_p is not best_p:
-                            del cur_p, cur_g
+                        if cur_g is not best_g:
+                            del cur_g
                         accepted = best_ok and (
                             best_v <= state.value + c1 * best_t * slope0
                         )
                         break
-                if cur_p is not best_p:
-                    del cur_p, cur_g
-                p2, v2, g2, ok2, gn2, m2 = eval_t(t_next)
-                cur_t, cur_p, cur_v, cur_g, cur_ok, cur_gnorm, cur_m = (
+                if cur_g is not best_g:
+                    del cur_g
+                best_g = _offload_grad(best_g)
+                v2, g2, ok2, gn2, m2 = eval_t(t_next)
+                cur_t, cur_v, cur_g, cur_ok, cur_gnorm, cur_m = (
                     t_next,
-                    p2,
                     v2,
                     g2,
                     ok2,
@@ -932,10 +970,10 @@ class QQNRunner:
                     m2,
                 )
                 if ok2 and (not best_ok or v2 < best_v):
-                    del best_p, best_g
-                    best_t, best_p, best_v, best_g, best_ok, best_gnorm = (
+                    if best_g is not grad:
+                        del best_g
+                    best_t, best_v, best_g, best_ok, best_gnorm = (
                         t_next,
-                        p2,
                         v2,
                         g2,
                         ok2,
@@ -944,7 +982,7 @@ class QQNRunner:
         else:
             val_only = grad_unused_after_step and self.path_strategy != "spline"
             best_t = init_step
-            best_p, best_v, best_g, best_ok, best_gnorm, _ = eval_t(
+            best_v, best_g, best_ok, best_gnorm, _ = eval_t(
                 best_t, value_only=val_only
             )
             accepted = best_ok and (best_v <= state.value + c1 * best_t * slope0)
@@ -953,30 +991,33 @@ class QQNRunner:
             if accepted and max_step > best_t:
                 while best_t * grow <= max_step and ls_iters < max_iter:
                     next_t = best_t * grow
-                    p2, v2, g2, ok2, gn2, _ = eval_t(next_t, value_only=val_only)
+                    best_g = _offload_grad(best_g)
+                    v2, g2, ok2, gn2, _ = eval_t(next_t, value_only=val_only)
                     ls_iters += 1
                     if (
                         ok2
                         and (v2 <= state.value + c1 * next_t * slope0)
                         and (v2 < best_v)
                     ):
-                        del best_p, best_g
-                        best_t, best_p, best_v, best_g, best_ok, best_gnorm = (
+                        if best_g is not grad:
+                            del best_g
+                        best_t, best_v, best_g, best_ok, best_gnorm = (
                             next_t,
-                            p2,
                             v2,
                             g2,
                             ok2,
                             gn2,
                         )
                     else:
-                        del p2, g2
+                        if g2 is not grad:
+                            del g2
                         break
 
             while not accepted and ls_iters < max_iter:
                 best_t *= shrink
-                del best_p, best_g
-                best_p, best_v, best_g, best_ok, best_gnorm, _ = eval_t(
+                if best_g is not grad:
+                    del best_g
+                best_v, best_g, best_ok, best_gnorm, _ = eval_t(
                     best_t, value_only=val_only
                 )
                 ls_iters += 1
@@ -991,12 +1032,13 @@ class QQNRunner:
                 )
                 if prop_t is None:
                     break
-                p_sp, v_sp, g_sp, ok_sp, gn_sp, _ = eval_t(prop_t)
+                best_g = _offload_grad(best_g)
+                v_sp, g_sp, ok_sp, gn_sp, _ = eval_t(prop_t)
                 if ok_sp and (not best_ok or v_sp < best_v):
-                    del best_p, best_g
-                    best_t, best_p, best_v, best_g, best_ok, best_gnorm = (
+                    if best_g is not grad:
+                        del best_g
+                    best_t, best_v, best_g, best_ok, best_gnorm = (
                         prop_t,
-                        p_sp,
                         v_sp,
                         g_sp,
                         ok_sp,
@@ -1005,34 +1047,59 @@ class QQNRunner:
                     if best_v <= state.value + c1 * best_t * slope0:
                         accepted = True
                 else:
-                    del p_sp, g_sp
+                    if g_sp is not grad:
+                        del g_sp
 
-        # Fallback safe step ONLY if line search failed
-        if self.line_search not in ("null", "fixed") and not (
-            best_ok and (best_v <= state.value or accepted)
-        ):
+        # Materialize winning candidate or run safe fallback step (note `_vg_jit` / `_loss_jit`
+        # donate `fb_p`, so if fallback succeeds we reconstruct `best_p` once in <1 ms)
+        if self.line_search in ("null", "fixed"):
+            if best_p is None:
+                if accepted:
+                    best_p = self._candidate_jit(
+                        params, g_ref, qn_dir, jnp.asarray(best_t, jnp.float32), tau_arr
+                    )
+                else:
+                    if best_g is not grad:
+                        del best_g
+                    best_p, best_v, best_g, best_t, best_gnorm = (
+                        params,
+                        state.value,
+                        grad,
+                        0.0,
+                        state.error,
+                    )
+        elif best_ok and (best_v <= state.value or accepted):
+            best_p = self._candidate_jit(
+                params, g_ref, qn_dir, jnp.asarray(best_t, jnp.float32), tau_arr
+            )
+        else:
+            if best_g is not grad:
+                del best_g
             fb_p, fb_t_arr = self._fallback_candidate_jit(params, grad, g_ref, tau_arr)
+            fb_t = float(fb_t_arr)
             if grad_unused_after_step and self.path_strategy != "spline":
                 fb_v_arr = self._loss_jit(fb_p, macro_batch)
+                del fb_p
                 fb_g = grad
                 fb_ok_g, fb_gnorm = True, state.error
             else:
                 fb_v_arr, fb_g = self._vg_jit(fb_p, macro_batch)
+                del fb_p
                 fb_ok_g, fb_gnorm = self._finite_and_norm_jit(fb_g)
             evals += 1
             fb_v = float(fb_v_arr)
             if math.isfinite(fb_v) and bool(fb_ok_g) and fb_v < state.value:
-                del best_p, best_g
-                best_p, best_v, best_g, best_t, best_gnorm = (
-                    fb_p,
+                best_p, _ = self._fallback_candidate_jit(params, grad, g_ref, tau_arr)
+                best_v, best_g, best_t, best_gnorm = (
                     fb_v,
                     fb_g,
-                    float(fb_t_arr),
+                    fb_t,
                     float(fb_gnorm),
                 )
                 accepted = True
             else:
-                del fb_p, fb_g, best_p, best_g
+                if fb_g is not grad:
+                    del fb_g
                 best_p, best_v, best_g, best_t, best_gnorm = (
                     params,
                     state.value,
@@ -1045,6 +1112,7 @@ class QQNRunner:
         if g_ref is not grad and g_ref is not qn_dir:
             del g_ref
         del qn_dir
+        best_g = _restore_grad(best_g)
 
         if self.use_sharded_lbfgs:
             if grad_unused_after_step:

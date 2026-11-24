@@ -6,7 +6,8 @@ RUN_ID="${RUN_ID:-local-$(date -u +%Y%m%dT%H%M%SZ)}"
 S3_BUCKET="${S3_BUCKET:-}"
 MAX_WALL_MINUTES="${MAX_WALL_MINUTES:-120}"
 
-export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.92}"
+export XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-cuda_async}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/jax_cache}"
 
 OUT_DIR="runs/${RUN_ID}"
@@ -49,7 +50,7 @@ if [ ! -d .venv ]; then
   .venv/bin/pip install -e ./qqn-jax -e ".[cuda]" >> "${LOG_FILE}" 2>&1
 fi
 
-echo "[qqn-llm] Starting run ${RUN_ID} with config ${CONFIG_PATH} (max ${MAX_WALL_MINUTES}m)" | tee -a "${LOG_FILE}"
+echo "[qqn-llm] Starting run ${RUN_ID} with config ${CONFIG_PATH} (max ${MAX_WALL_MINUTES}m, allocator=${XLA_PYTHON_CLIENT_ALLOCATOR}, preallocate=${XLA_PYTHON_CLIENT_PREALLOCATE})" | tee -a "${LOG_FILE}"
 timeout "${MAX_WALL_MINUTES}m" \
   .venv/bin/python -m qqn_llm.train \
   --config "${CONFIG_PATH}" \
