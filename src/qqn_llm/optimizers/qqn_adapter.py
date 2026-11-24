@@ -248,8 +248,20 @@ class QQNRunner:
             return t_mapped, dt_ds
 
         # 2. Pure elementwise path candidate x + d(s)
-        def _candidate_fn(params, g_tan, qn_dir, s, tau):
+        # Note: for "raw", "reparam", and "scaled", g_ref is `grad` itself so -grad / -tau*grad
+        # fuses inline without allocating an extra 18.6 GB PyTree buffer on 8x A100-40GB.
+        def _effective_gtan(g_ref, tau):
+            if is_linear or t_mode in ("raw", "reparam"):
+                return tree_negative(g_ref)
+            if t_mode == "scaled":
+                return jax.tree_util.tree_map(
+                    lambda gi: (-tau.astype(gi.dtype) * gi).astype(gi.dtype), g_ref
+                )
+            return g_ref  # Already -alpha_tan * H0 * grad for "preconditioned"
+
+        def _candidate_fn(params, g_ref, qn_dir, s, tau):
             s_arr = jnp.asarray(s, jnp.float32)
+            g_tan = _effective_gtan(g_ref, tau)
             if t_mode == "reparam" and not is_linear:
                 t_m, _ = _mobius_map(jnp.minimum(s_arr, 1.0), tau)
                 d_quad = self.path.offset(t_m, g_tan, qn_dir)
@@ -270,10 +282,11 @@ class QQNRunner:
         self._candidate_jit = jax.jit(_candidate_fn, out_shardings=param_sharding)
 
         # 3. Fused post-probe check: finiteness + grad L2 norm + directional path slope wrt s
-        def _post_eval_fn(g_arr, g_tan, qn_dir, s, tau, compute_slope):
+        def _post_eval_fn(g_arr, g_ref, qn_dir, s, tau, compute_slope):
             s_arr = jnp.asarray(s, jnp.float32)
             g_ok = tree_all_finite(g_arr)
             g_norm = tree_l2_norm(g_arr)
+            g_tan = _effective_gtan(g_ref, tau)
             if t_mode == "reparam" and not is_linear:
                 t_m, dt_ds = _mobius_map(jnp.minimum(s_arr, 1.0), tau)
                 vel_quad = self.path.velocity(t_m, g_tan, qn_dir)
@@ -296,48 +309,45 @@ class QQNRunner:
             out_shardings=(self.replicated, self.replicated),
         )
 
-        # 4. Fused step preparation: construct g_tan & tau according to tangent_mode
-        def _prepare_step_fn(grad, g_pre_raw, qn_dir):
+        # 4. Fused step preparation: construct tau, slope0, qn_slope (and scaled g_pre only when needed)
+        def _prepare_scalars_fn(grad, qn_dir):
             gnorm = tree_l2_norm(grad).astype(jnp.float32)
             qnorm = tree_l2_norm(qn_dir).astype(jnp.float32)
             tau = jnp.clip(qnorm / (gnorm + 1e-12), 1e-8, 1.0)
             s_q = -tree_vdot(grad, qn_dir, accum_dtype=jnp.float32)
-            neg_grad = tree_negative(grad)
-
             if is_linear:
-                g_tan = neg_grad
                 slope0 = -s_q
             elif t_mode == "raw":
-                g_tan = neg_grad
                 slope0 = -(gnorm * gnorm)
-            elif t_mode == "reparam":
-                # Exact canonical tangent g_tan = -∇f; chain rule at s=0 gives dt/ds = tau
-                g_tan = neg_grad
-                slope0 = -tau * (gnorm * gnorm)
-            elif t_mode == "scaled":
-                g_tan = jax.tree_util.tree_map(
-                    lambda ng: (tau.astype(ng.dtype) * ng).astype(ng.dtype), neg_grad
-                )
-                slope0 = -tau * (gnorm * gnorm)
             else:
-                # tangent_mode == "preconditioned"
-                s_g = -tree_vdot(grad, g_pre_raw, accum_dtype=jnp.float32)
-                ratio = jnp.where(
-                    (s_g > 1e-20) & (s_q > 0.0),
-                    jnp.clip(s_q / jnp.maximum(s_g, 1e-20), 0.05, 1.0),
-                    jnp.asarray(1.0, jnp.float32),
-                )
-                g_tan = jax.tree_util.tree_map(
-                    lambda gt: (ratio.astype(gt.dtype) * gt).astype(gt.dtype),
-                    g_pre_raw,
-                )
-                slope0 = -ratio * s_g
+                # "reparam" and "scaled" both have initial slope -tau * ||grad||^2
+                slope0 = -tau * (gnorm * gnorm)
+            return tau, slope0, -s_q
 
-            qn_slope = -s_q
-            return g_tan, tau, slope0, qn_slope
+        def _prepare_precond_fn(grad, g_pre_raw, qn_dir):
+            gnorm = tree_l2_norm(grad).astype(jnp.float32)
+            qnorm = tree_l2_norm(qn_dir).astype(jnp.float32)
+            tau = jnp.clip(qnorm / (gnorm + 1e-12), 1e-8, 1.0)
+            s_q = -tree_vdot(grad, qn_dir, accum_dtype=jnp.float32)
+            s_g = -tree_vdot(grad, g_pre_raw, accum_dtype=jnp.float32)
+            ratio = jnp.where(
+                (s_g > 1e-20) & (s_q > 0.0),
+                jnp.clip(s_q / jnp.maximum(s_g, 1e-20), 0.05, 1.0),
+                jnp.asarray(1.0, jnp.float32),
+            )
+            g_tan = jax.tree_util.tree_map(
+                lambda gt: (ratio.astype(gt.dtype) * gt).astype(gt.dtype),
+                g_pre_raw,
+            )
+            slope0 = -s_q if is_linear else (-ratio * s_g)
+            return g_tan, tau, slope0, -s_q
 
-        self._prepare_step_jit = jax.jit(
-            _prepare_step_fn,
+        self._prepare_scalars_jit = jax.jit(
+            _prepare_scalars_fn,
+            out_shardings=(self.replicated, self.replicated, self.replicated),
+        )
+        self._prepare_precond_jit = jax.jit(
+            _prepare_precond_fn,
             out_shardings=(
                 param_sharding,
                 self.replicated,
@@ -347,7 +357,8 @@ class QQNRunner:
         )
 
         # 5. Safe fallback candidate if line search fails
-        def _fallback_candidate_fn(params, grad, g_tan, tau):
+        def _fallback_candidate_fn(params, grad, g_ref, tau):
+            g_tan = _effective_gtan(g_ref, tau)
             if t_mode in ("scaled", "preconditioned"):
                 scale = jnp.asarray(0.25, jnp.float32)
                 return tree_add_scaled(params, scale, g_tan), scale
@@ -448,6 +459,7 @@ class QQNRunner:
         self._preview_v_and_gpre_jit = jax.jit(
             _preview_v_and_gpre_fn,
             out_shardings=(param_sharding, self.replicated, param_sharding),
+            donate_argnums=(1,),
         )
         self._apply_adam_h0_jit = jax.jit(
             _apply_adam_h0_fn,
@@ -557,19 +569,35 @@ class QQNRunner:
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     def _sharded_lbfgs_direction_and_tangent(
-        self, grad, state: ShardedLBFGSState, lr_mult: float = 1.0
+        self,
+        grad,
+        state: ShardedLBFGSState,
+        lr_mult: float = 1.0,
+        *,
+        mutate_v: bool = True,
     ):
-        """Zero-sync Nocedal & Wright Algorithm 7.4 returning ``(qn_dir, g_pre, v_cand)``."""
+        """Zero-sync Nocedal & Wright Algorithm 7.4 returning ``(qn_dir, g_pre_or_none)``."""
         lr_mult_arr = jnp.asarray(lr_mult, jnp.float32)
+        need_gpre = self.tangent_mode == "preconditioned"
         if self.use_adam_precond:
             step_t = jnp.asarray(state.step + 1, jnp.int32)
             base_lr_arr = jnp.asarray(float(self.cfg.learning_rate), jnp.float32)
-            v_cand, c_k, g_pre_unsched = self._preview_v_and_gpre_jit(
-                grad, state.v, step_t, base_lr_arr
+            v_in = (
+                state.v
+                if mutate_v
+                else jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), state.v)
             )
+            v_next, c_k, g_pre_unsched = self._preview_v_and_gpre_jit(
+                grad, v_in, step_t, base_lr_arr
+            )
+            if mutate_v:
+                state.v = v_next
+                state.step += 1
+
             if not state.pairs:
-                g_pre_sched = self._scale_jit(lr_mult_arr, g_pre_unsched)
-                return g_pre_sched, g_pre_sched, v_cand
+                qn_sched = self._scale_jit(lr_mult_arr, g_pre_unsched)
+                del g_pre_unsched
+                return qn_sched, (qn_sched if need_gpre else None)
 
             q = grad
             alphas = []
@@ -577,7 +605,7 @@ class QQNRunner:
                 q, alpha_i = self._loop1_step_jit(q, s_i, y_i, rho_arr)
                 alphas.append(alpha_i)
 
-            r = self._apply_adam_h0_jit(q, v_cand, step_t, base_lr_arr, c_k)
+            r = self._apply_adam_h0_jit(q, v_next, step_t, base_lr_arr, c_k)
 
             for (s_i, y_i, rho_arr), alpha_i in zip(
                 reversed(state.pairs), reversed(alphas)
@@ -587,13 +615,17 @@ class QQNRunner:
             qn_dir, g_pre_sched = self._finalize_lbfgs_dir_jit(
                 r, grad, g_pre_unsched, lr_mult_arr
             )
-            return qn_dir, g_pre_sched, v_cand
+            del g_pre_unsched
+            if not need_gpre:
+                del g_pre_sched
+                return qn_dir, None
+            return qn_dir, g_pre_sched
 
         # Plain scalar-H0 L-BFGS (H0 = gamma * I)
         gamma_eff = float(state.gamma) * lr_mult
-        g_pre = self._scale_jit(jnp.asarray(-gamma_eff, jnp.float32), grad)
         if not state.pairs:
-            return g_pre, g_pre, None
+            qn_dir = self._scale_jit(jnp.asarray(-gamma_eff, jnp.float32), grad)
+            return qn_dir, (qn_dir if need_gpre else None)
 
         q = grad
         alphas = []
@@ -607,13 +639,15 @@ class QQNRunner:
         ):
             r = self._loop2_step_jit(r, s_i, y_i, rho_arr, alpha_i)
 
+        g_pre_unsched = self._scale_jit(jnp.asarray(-float(state.gamma), jnp.float32), grad)
         qn_dir, g_pre_sched = self._finalize_lbfgs_dir_jit(
-            r,
-            grad,
-            self._scale_jit(jnp.asarray(-float(state.gamma), jnp.float32), grad),
-            lr_mult_arr,
+            r, grad, g_pre_unsched, lr_mult_arr
         )
-        return qn_dir, g_pre_sched, None
+        del g_pre_unsched
+        if not need_gpre:
+            del g_pre_sched
+            return qn_dir, None
+        return qn_dir, g_pre_sched
 
     def _sharded_lbfgs_update(
         self,
@@ -622,12 +656,8 @@ class QQNRunner:
         new_params,
         grad,
         new_grad,
-        v_cand,
         accepted: bool,
     ) -> ShardedLBFGSState:
-        if self.use_adam_precond and accepted and v_cand is not None:
-            state.v = v_cand
-            state.step += 1
         if not accepted:
             return state
         s, y, ys_arr, yy_arr, ss_arr = self._lbfgs_pair_jit(
@@ -736,35 +766,44 @@ class QQNRunner:
     ):
         grad = state.grad
         lr_mult = self._lr_multiplier(state.step_count)
-        v_cand = None
 
         if self.use_sharded_lbfgs:
-            qn_dir, g_pre_raw, v_cand = self._sharded_lbfgs_direction_and_tangent(
+            qn_dir, g_pre_raw = self._sharded_lbfgs_direction_and_tangent(
                 grad, state.oracle_state, lr_mult=lr_mult
             )
         else:
             qn_dir, _ = self._oracle_dir_jit(params, grad, state.oracle_state)
             if lr_mult != 1.0 and self.oracle_name in ("adam", "lbfgs+adam"):
                 qn_dir = self._scale_jit(jnp.asarray(lr_mult, jnp.float32), qn_dir)
-            if self.tangent_mode == "preconditioned" and isinstance(
-                state.oracle_state, AdamState
-            ):
-                eff_lr = jnp.asarray(
-                    float(self.cfg.learning_rate) * lr_mult, jnp.float32
-                )
-                g_pre_raw = self._adam_diag_tangent_jit(
-                    grad,
-                    state.oracle_state.v,
-                    state.oracle_state.step + jnp.asarray(1, jnp.int32),
-                    eff_lr,
-                )
+            if self.tangent_mode == "preconditioned":
+                if isinstance(state.oracle_state, AdamState):
+                    eff_lr = jnp.asarray(
+                        float(self.cfg.learning_rate) * lr_mult, jnp.float32
+                    )
+                    g_pre_raw = self._adam_diag_tangent_jit(
+                        grad,
+                        state.oracle_state.v,
+                        state.oracle_state.step + jnp.asarray(1, jnp.int32),
+                        eff_lr,
+                    )
+                else:
+                    g_pre_raw = jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), qn_dir)
             else:
-                g_pre_raw = qn_dir
+                g_pre_raw = None
 
-        g_tan, tau_arr, slope0_arr, qn_slope_arr = self._prepare_step_jit(
-            grad, g_pre_raw, qn_dir
-        )
-        del g_pre_raw
+        if self.tangent_mode == "preconditioned" and g_pre_raw is not None:
+            if g_pre_raw is qn_dir:
+                g_ref = qn_dir
+                tau_arr, _, qn_slope_arr = self._prepare_scalars_jit(grad, qn_dir)
+                slope0_arr = qn_slope_arr
+            else:
+                g_ref, tau_arr, slope0_arr, qn_slope_arr = self._prepare_precond_jit(
+                    grad, g_pre_raw, qn_dir
+                )
+                del g_pre_raw
+        else:
+            g_ref = grad
+            tau_arr, slope0_arr, qn_slope_arr = self._prepare_scalars_jit(grad, qn_dir)
         slope0 = float(slope0_arr)
         qn_slope = float(qn_slope_arr)
 
@@ -790,7 +829,7 @@ class QQNRunner:
         def eval_t(t_val: float, *, value_only: bool = False):
             nonlocal evals
             t_arr = jnp.asarray(t_val, jnp.float32)
-            cand = self._candidate_jit(params, g_tan, qn_dir, t_arr, tau_arr)
+            cand = self._candidate_jit(params, g_ref, qn_dir, t_arr, tau_arr)
             if value_only:
                 v_arr = self._loss_jit(cand, macro_batch)
                 evals += 1
@@ -801,7 +840,7 @@ class QQNRunner:
             evals += 1
             v = float(v_arr)
             g_ok, g_norm, slope_arr = self._post_eval_jit(
-                g_arr, g_tan, qn_dir, t_arr, tau_arr, jnp.asarray(need_slope)
+                g_arr, g_ref, qn_dir, t_arr, tau_arr, jnp.asarray(need_slope)
             )
             ok = math.isfinite(v) and bool(g_ok)
             slope_t = float(slope_arr) if (need_slope and ok) else 0.0
@@ -814,7 +853,7 @@ class QQNRunner:
             best_t = min(1.0, max_step)
             if grad_unused_after_step:
                 t_arr = jnp.asarray(best_t, jnp.float32)
-                best_p = self._candidate_jit(params, g_tan, qn_dir, t_arr, tau_arr)
+                best_p = self._candidate_jit(params, g_ref, qn_dir, t_arr, tau_arr)
                 best_v, best_g, best_ok, best_gnorm = (
                     state.value,
                     grad,
@@ -972,7 +1011,7 @@ class QQNRunner:
         if self.line_search not in ("null", "fixed") and not (
             best_ok and (best_v <= state.value or accepted)
         ):
-            fb_p, fb_t_arr = self._fallback_candidate_jit(params, grad, g_tan, tau_arr)
+            fb_p, fb_t_arr = self._fallback_candidate_jit(params, grad, g_ref, tau_arr)
             if grad_unused_after_step and self.path_strategy != "spline":
                 fb_v_arr = self._loss_jit(fb_p, macro_batch)
                 fb_g = grad
@@ -1003,13 +1042,12 @@ class QQNRunner:
                 )
                 accepted = False
 
-        del qn_dir, g_tan
+        if g_ref is not grad and g_ref is not qn_dir:
+            del g_ref
+        del qn_dir
 
         if self.use_sharded_lbfgs:
             if grad_unused_after_step:
-                if self.use_adam_precond and accepted and v_cand is not None:
-                    state.oracle_state.v = v_cand
-                    state.oracle_state.step += 1
                 new_oracle_state = state.oracle_state
             else:
                 new_oracle_state = self._sharded_lbfgs_update(
@@ -1018,7 +1056,6 @@ class QQNRunner:
                     best_p,
                     grad,
                     best_g,
-                    v_cand,
                     accepted,
                 )
         else:

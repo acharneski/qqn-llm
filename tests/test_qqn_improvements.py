@@ -46,14 +46,12 @@ def test_tangent_modes_separate_reparameterization_from_metric_change():
     )
     runner_raw = QQNRunner(llm_scale_bowl, cfg_raw, mesh=mesh, param_sharding=sharding)
     st_raw = runner_raw.init(p0, None)
-    qn_raw, g_pre_raw, _ = runner_raw._sharded_lbfgs_direction_and_tangent(
-        st_raw.grad, st_raw.oracle_state
+    qn_raw, _ = runner_raw._sharded_lbfgs_direction_and_tangent(
+        st_raw.grad, st_raw.oracle_state, mutate_v=False
     )
-    g_tan_raw, tau_raw, _, _ = runner_raw._prepare_step_jit(
-        st_raw.grad, g_pre_raw, qn_raw
-    )
+    tau_raw, _, _ = runner_raw._prepare_scalars_jit(st_raw.grad, qn_raw)
     cand_raw_half = runner_raw._candidate_jit(
-        p0, g_tan_raw, qn_raw, jnp.asarray(0.5, jnp.float32), tau_raw
+        p0, st_raw.grad, qn_raw, jnp.asarray(0.5, jnp.float32), tau_raw
     )
     assert float(llm_scale_bowl(cand_raw_half, None)) > st_raw.value * 1e4
 
@@ -69,26 +67,24 @@ def test_tangent_modes_separate_reparameterization_from_metric_change():
     )
     runner_rep = QQNRunner(llm_scale_bowl, cfg_rep, mesh=mesh, param_sharding=sharding)
     st_rep = runner_rep.init(p0, None)
-    qn_rep, g_pre_rep, _ = runner_rep._sharded_lbfgs_direction_and_tangent(
-        st_rep.grad, st_rep.oracle_state
+    qn_rep, _ = runner_rep._sharded_lbfgs_direction_and_tangent(
+        st_rep.grad, st_rep.oracle_state, mutate_v=False
     )
-    g_tan_rep, tau_rep, slope0_rep, _ = runner_rep._prepare_step_jit(
-        st_rep.grad, g_pre_rep, qn_rep
-    )
+    tau_rep, slope0_rep, _ = runner_rep._prepare_scalars_jit(st_rep.grad, qn_rep)
     assert float(slope0_rep) < 0.0
     for s_val in (0.1, 0.5, 0.9, 1.0):
         tau_f = float(tau_rep)
         t_equiv = (tau_f * s_val) / ((1.0 - s_val) + tau_f * s_val)
         p_rep = runner_rep._candidate_jit(
-            p0, g_tan_rep, qn_rep, jnp.asarray(s_val, jnp.float32), tau_rep
+            p0, st_rep.grad, qn_rep, jnp.asarray(s_val, jnp.float32), tau_rep
         )
         p_raw_at_t = runner_raw._candidate_jit(
-            p0, g_tan_raw, qn_raw, jnp.asarray(t_equiv, jnp.float32), tau_raw
+            p0, st_raw.grad, qn_raw, jnp.asarray(t_equiv, jnp.float32), tau_raw
         )
         for k in ("embed", "mlp"):
             assert jnp.allclose(p_rep[k], p_raw_at_t[k], rtol=1e-5, atol=1e-7)
     cand_rep_half = runner_rep._candidate_jit(
-        p0, g_tan_rep, qn_rep, jnp.asarray(0.5, jnp.float32), tau_rep
+        p0, st_rep.grad, qn_rep, jnp.asarray(0.5, jnp.float32), tau_rep
     )
     assert float(llm_scale_bowl(cand_rep_half, None)) < st_rep.value
 
@@ -104,15 +100,19 @@ def test_tangent_modes_separate_reparameterization_from_metric_change():
         )
         runner_m = QQNRunner(llm_scale_bowl, cfg_m, mesh=mesh, param_sharding=sharding)
         st_m = runner_m.init(p0, None)
-        qn_m, g_pre_m, _ = runner_m._sharded_lbfgs_direction_and_tangent(
-            st_m.grad, st_m.oracle_state
+        qn_m, g_pre_m = runner_m._sharded_lbfgs_direction_and_tangent(
+            st_m.grad, st_m.oracle_state, mutate_v=False
         )
-        g_tan_m, tau_m, slope0_m, _ = runner_m._prepare_step_jit(
-            st_m.grad, g_pre_m, qn_m
-        )
+        if mode == "preconditioned":
+            g_ref_m, tau_m, slope0_m, _ = runner_m._prepare_precond_jit(
+                st_m.grad, g_pre_m, qn_m
+            )
+        else:
+            g_ref_m = st_m.grad
+            tau_m, slope0_m, _ = runner_m._prepare_scalars_jit(st_m.grad, qn_m)
         assert float(slope0_m) < 0.0
         cand_half = runner_m._candidate_jit(
-            p0, g_tan_m, qn_m, jnp.asarray(0.5, jnp.float32), tau_m
+            p0, g_ref_m, qn_m, jnp.asarray(0.5, jnp.float32), tau_m
         )
         assert float(llm_scale_bowl(cand_half, None)) < st_m.value
 
@@ -141,11 +141,11 @@ def test_outer_lr_schedule_scales_lbfgs_secant_subspace():
         p, st, _ = runner.step(p, st, None)
     assert len(st.oracle_state.pairs) >= 2
 
-    d_full, _, _ = runner._sharded_lbfgs_direction_and_tangent(
-        st.grad, st.oracle_state, lr_mult=1.0
+    d_full, _ = runner._sharded_lbfgs_direction_and_tangent(
+        st.grad, st.oracle_state, lr_mult=1.0, mutate_v=False
     )
-    d_tenth, _, _ = runner._sharded_lbfgs_direction_and_tangent(
-        st.grad, st.oracle_state, lr_mult=0.1
+    d_tenth, _ = runner._sharded_lbfgs_direction_and_tangent(
+        st.grad, st.oracle_state, lr_mult=0.1, mutate_v=False
     )
     assert jnp.allclose(d_tenth["w"], 0.1 * d_full["w"], rtol=1e-5, atol=1e-6)
 
