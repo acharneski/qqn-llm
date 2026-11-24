@@ -1,0 +1,47 @@
+experiment_name: gemma4_e2b_pokemon_pirate
+output_dir: runs/gemma4_e2b_pokemon_pirate
+seed: 42
+
+model:
+  variant: gemma4_e2b
+  checkpoint: gemma4_e2b_it
+  dtype: bfloat16
+  master_dtype: float32
+  remat: true
+
+data:
+  source: jsonl
+  jsonl_path: data/pokemon_pirate.jsonl   # Edit this file freely to customize behavior!
+  chat_format: true                       # Uses Gemma 4 turn markers matching Gemma4Sampler
+  seq_len: 256
+  train_examples: 128                     # 16 micro-batches (balanced Pokemon-pirate + normal controls)
+  val_examples: 32
+  micro_batch_size: 8                     # 1 sequence per GPU across 8x A100
+  batch_mode: fixed_subset
+
+training:
+  steps: 15
+  eval_every: 3
+  checkpoint_every: 0
+  save_best_checkpoint: true              # Saves best-val Orbax weights in bfloat16 (~9.3 GB)
+  save_final_checkpoint: true             # Also saves final weights
+  checkpoint_dtype: bfloat16
+  l2_reg: 0.0
+  fsdp_axis_size: 8
+  stop_on_train_loss: 5.0e-3
+  stop_on_consecutive_stalls: 2
+
+optimizers:
+  # Phase 1 Champion: minimal weight perturbation preserves non-Pokemon assistant behavior!
+  - name: lbfgs_adam_strong_wolfe
+    kind: qqn
+    oracle: lbfgs_adam
+    learning_rate: 2.0e-5
+    history_size: 5
+    line_search: strong_wolfe
+    path_strategy: quadratic
+    c1: 1.0e-4
+    c2: 0.9
+    ls_max_iter: 4
+    max_t: 2.0
+    remember_step_size: true

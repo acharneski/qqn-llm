@@ -174,6 +174,7 @@ class HostQQNState:
     step_size: float
     error: float
     num_evals: int
+    step_count: int = 0
 
 
 class QQNRunner:
@@ -187,8 +188,10 @@ class QQNRunner:
         cfg: OptimizerConfig,
         mesh: Mesh,
         param_sharding: Any,
+        total_steps: int = 30,
     ):
         self.cfg = cfg
+        self.total_steps = max(1, int(total_steps))
         self.mesh = mesh
         self.param_sharding = param_sharding
         self.replicated = NamedSharding(mesh, P())
@@ -304,11 +307,11 @@ class QQNRunner:
                 grad,
             )
 
-        def _apply_adam_h0_fn(q, v, step_arr):
+        def _apply_adam_h0_fn(q, v, step_arr, lr_arr):
             bc2 = 1.0 - (beta2 ** step_arr.astype(jnp.float32))
             return jax.tree_util.tree_map(
                 lambda qi, vi: (
-                    (lr / (jnp.sqrt(vi / bc2) + eps)) * qi.astype(jnp.float32)
+                    (lr_arr / (jnp.sqrt(vi / bc2) + eps)) * qi.astype(jnp.float32)
                 ).astype(qi.dtype),
                 q,
                 v,
@@ -344,20 +347,28 @@ class QQNRunner:
             donate_argnums=(0,),
         )
 
-    def _apply_h0(self, q, state: ShardedLBFGSState):
+    def _lr_multiplier(self, step_count: int) -> float:
+        """Cosine LR multiplier (1.0 -> 0.1) when ``cfg.use_lr_schedule`` is enabled."""
+        if not self.cfg.use_lr_schedule:
+            return 1.0
+        progress = min(1.0, max(0.0, step_count / float(self.total_steps)))
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def _apply_h0(self, q, state: ShardedLBFGSState, lr_mult: float = 1.0):
         if self.use_adam_precond:
             step_t = max(1, state.step)
-            return self._apply_adam_h0_jit(q, state.v, jnp.asarray(step_t, jnp.int32))
+            eff_lr = jnp.asarray(float(self.cfg.learning_rate) * lr_mult, jnp.float32)
+            return self._apply_adam_h0_jit(q, state.v, jnp.asarray(step_t, jnp.int32), eff_lr)
         return self._scale_jit(jnp.asarray(state.gamma, jnp.float32), q)
 
-    def _sharded_lbfgs_direction(self, grad, state: ShardedLBFGSState):
+    def _sharded_lbfgs_direction(self, grad, state: ShardedLBFGSState, lr_mult: float = 1.0):
         """Nocedal & Wright Algorithm 7.4 over individually FSDP-sharded (s_i, y_i) trees."""
         if self.use_adam_precond:
             state.v = self._update_v_jit(state.v, grad)
             state.step += 1
 
         if not state.pairs:
-            r = self._apply_h0(grad, state)
+            r = self._apply_h0(grad, state, lr_mult=lr_mult)
             return self._scale_jit(jnp.asarray(-1.0, jnp.float32), r)
 
         q = grad
@@ -367,7 +378,7 @@ class QQNRunner:
             alphas.append(alpha_i)
             q = self._axpy_jit(q, jnp.asarray(-alpha_i, jnp.float32), y_i)
 
-        r = self._apply_h0(q, state)
+        r = self._apply_h0(q, state, lr_mult=lr_mult)
 
         for (s_i, y_i, rho_i), alpha_i in zip(reversed(state.pairs), reversed(alphas)):
             beta_i = rho_i * float(self._vdot_jit(y_i, r))
@@ -376,7 +387,7 @@ class QQNRunner:
         d = self._scale_jit(jnp.asarray(-1.0, jnp.float32), r)
         gd = float(self._vdot_jit(grad, d))
         if not (gd < 0.0):
-            r_fb = self._apply_h0(grad, state)
+            r_fb = self._apply_h0(grad, state, lr_mult=lr_mult)
             return self._scale_jit(jnp.asarray(-1.0, jnp.float32), r_fb)
         return d
 
@@ -424,21 +435,29 @@ class QQNRunner:
     def refresh(self, params, state: HostQQNState, macro_batch) -> HostQQNState:
         val, grad = self._vg_jit(params, macro_batch)
         _, gnorm = self._finite_and_norm_jit(grad)
+        if self.use_sharded_lbfgs and self.cfg.clear_lbfgs_on_refresh:
+            # Drop stale curvature pairs from the previous macro-batch while
+            # retaining the cross-batch diagonal Adam second moment `v`.
+            state.oracle_state.pairs.clear()
         return HostQQNState(
             value=float(val),
             grad=grad,
             oracle_state=state.oracle_state,
-            step_size=state.step_size,
+            step_size=1.0,
             error=float(gnorm),
             num_evals=state.num_evals + 1,
+            step_count=state.step_count,
         )
 
     def step(self, params, state: HostQQNState, macro_batch):
         grad = state.grad
+        lr_mult = self._lr_multiplier(state.step_count)
         if self.use_sharded_lbfgs:
-            qn_dir = self._sharded_lbfgs_direction(grad, state.oracle_state)
+            qn_dir = self._sharded_lbfgs_direction(grad, state.oracle_state, lr_mult=lr_mult)
         else:
             qn_dir, _ = self._oracle_dir_jit(params, grad, state.oracle_state)
+            if lr_mult != 1.0 and self.oracle_name in ("adam", "lbfgs+adam"):
+                qn_dir = self._scale_jit(jnp.asarray(lr_mult, jnp.float32), qn_dir)
 
         slope0_arr, qn_slope_arr, _ = self._slopes_jit(grad, qn_dir)
         slope0 = float(slope0_arr)
@@ -616,6 +635,7 @@ class QQNRunner:
             step_size=best_t if accepted and best_t > 0.0 else 1.0,
             error=best_gnorm,
             num_evals=new_num_evals,
+            step_count=state.step_count + 1,
         )
         metrics = {
             "loss": best_v,

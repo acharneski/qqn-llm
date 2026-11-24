@@ -69,19 +69,45 @@ def _get_gemma_tokenizer():
     raise RuntimeError("No Gemma tokenizer class found in gemma.gm.text")
 
 
+def _format_chat_prompt(prompt: str, tokenizer) -> str:
+    """Format a user prompt with Gemma 4's exact turn template used by Gemma4Sampler."""
+    try:
+        from gemma.gm.text import _sampler
+
+        fmt = getattr(tokenizer, "FORMAT", None)
+        if fmt is not None:
+            normalized = _sampler._normalize_prompt(prompt, format=fmt)
+            if isinstance(normalized, list) and normalized:
+                return normalized[0]
+            if isinstance(normalized, str):
+                return normalized
+    except Exception:
+        pass
+    return prompt
+
+
 def _tokenize_pairs(
-    pairs: list[tuple[str, str]], seq_len: int, tokenizer
+    pairs: list[tuple[str, str]],
+    seq_len: int,
+    tokenizer,
+    *,
+    chat_format: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = len(pairs)
     inputs = np.zeros((n, seq_len), dtype=np.int32)
     targets = np.zeros((n, seq_len), dtype=np.int32)
     masks = np.zeros((n, seq_len), dtype=np.float32)
 
+    special = getattr(tokenizer, "special_tokens", None)
+    eos_id = getattr(special, "EOS", getattr(tokenizer, "eos_id", 1))
+    eot_id = getattr(special, "END_OF_TURN", None)
+
     for i, (prompt, response) in enumerate(pairs):
-        p_ids = list(tokenizer.encode(prompt, add_bos=True))
+        formatted_prompt = _format_chat_prompt(prompt, tokenizer) if chat_format else prompt
+        p_ids = list(tokenizer.encode(formatted_prompt, add_bos=True))
         r_ids = list(tokenizer.encode(response, add_bos=False))
-        eos_id = getattr(tokenizer, "eos_id", 1)
-        full = (p_ids + r_ids + [eos_id])[: seq_len + 1]
+        tail = [eot_id, eos_id] if (chat_format and eot_id is not None) else [eos_id]
+        full = (p_ids + r_ids + tail)[: seq_len + 1]
         if len(full) < 2:
             continue
         seq_in = full[:-1]
@@ -149,12 +175,17 @@ class DatasetBundle:
             *val_arrays, micro_batch_size=cfg.micro_batch_size
         )
 
-    def macro_batch_iterator(self, num_outer_batches: int) -> Iterator[dict[str, jnp.ndarray]]:
-        """Yield macro-batches for Mode B (consistent macro-batch stochastic SFT)."""
+    def macro_batch_iterator(
+        self,
+        num_outer_batches: int,
+        macro_batch_examples: int | None = None,
+        seed_offset: int = 0,
+    ) -> Iterator[dict[str, jnp.ndarray]]:
+        """Yield macro-batches for Mode B / multi-phase SFT."""
         inputs, targets, masks = self.train_arrays
         n = inputs.shape[0]
-        bs = min(self.cfg.macro_batch_examples, n)
-        rng = np.random.default_rng(self.seed)
+        bs = min(macro_batch_examples or self.cfg.macro_batch_examples, n)
+        rng = np.random.default_rng(self.seed + seed_offset)
         for _ in range(num_outer_batches):
             idx = rng.choice(n, size=bs, replace=False)
             yield _pack_macro_batch(
@@ -177,11 +208,13 @@ def load_dataset_bundle(
     print(f"[qqn-llm] Loading tokenizer and dataset ({cfg.source})...", flush=True)
     tokenizer = _get_gemma_tokenizer()
     train_pairs, val_pairs = _load_text_pairs(cfg)
+    use_chat = cfg.source == "jsonl" and cfg.chat_format
     print(
-        f"[qqn-llm] Tokenizing {len(train_pairs)} train / {len(val_pairs)} val examples (seq_len={cfg.seq_len})...",
+        f"[qqn-llm] Tokenizing {len(train_pairs)} train / {len(val_pairs)} val examples "
+        f"(seq_len={cfg.seq_len}, chat_format={use_chat})...",
         flush=True,
     )
-    train_arr = _tokenize_pairs(train_pairs, cfg.seq_len, tokenizer)
-    val_arr = _tokenize_pairs(val_pairs, cfg.seq_len, tokenizer)
+    train_arr = _tokenize_pairs(train_pairs, cfg.seq_len, tokenizer, chat_format=use_chat)
+    val_arr = _tokenize_pairs(val_pairs, cfg.seq_len, tokenizer, chat_format=use_chat)
     print("[qqn-llm] Dataset tokenization complete.", flush=True)
     return DatasetBundle(train_arr, val_arr, cfg, seed)

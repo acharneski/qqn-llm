@@ -1,0 +1,153 @@
+experiment_name: gemma4_e2b_aws_two_phase
+output_dir: runs/gemma4_e2b_aws_two_phase
+seed: 42
+
+model:
+  variant: gemma4_e2b
+  checkpoint: gemma4_e2b_it
+  dtype: bfloat16
+  master_dtype: float32
+  remat: true
+
+data:
+  source: gsm8k
+  seq_len: 512
+  train_examples: 7473          # Full GSM8K train split
+  val_examples: 256             # Larger val split for low-variance comparison
+  micro_batch_size: 8           # 1 sequence per GPU across 8x A100/H100
+  batch_mode: macro_batch
+  macro_batch_examples: 128
+  inner_steps_per_batch: 1
+
+training:
+  steps: 37                     # Overridden by per-phase step counts
+  eval_every: 5
+  checkpoint_every: 0
+  l2_reg: 0.0
+  fsdp_axis_size: 8
+  stop_on_train_loss: 0.0
+  stop_on_consecutive_stalls: 3
+
+optimizers:
+  # Control 1: Pure small-batch AdamW throughout (standard LLM fine-tuning)
+  - name: adamw_small_only
+    kind: adamw
+    phases:
+      - name: small_all
+        kind: adamw
+        steps: 37
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+
+  # Control 2: Two-phase AdamW (small batch -> intensive 768-example batch)
+  # Isolates batch-size increase from switching to L-BFGS curvature.
+  - name: adamw_two_phase
+    kind: adamw
+    phases:
+      - name: rough_small
+        kind: adamw
+        steps: 25
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: polish_intensive_adamw
+        kind: adamw
+        steps: 12
+        macro_batch_examples: 768
+        inner_steps_per_batch: 4
+        learning_rate: 1.0e-5
+        warmup_ratio: 0.0
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+
+  # Treatment A: AdamW rough phase (128 ex/step) -> QQN L-BFGS-Adam Strong Wolfe polish (768 ex/batch)
+  - name: two_phase_adamw_to_lbfgs_adam
+    kind: qqn
+    phases:
+      - name: rough_adamw
+        kind: adamw
+        steps: 25
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: polish_lbfgs_adam_sw
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 5
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-5
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 12
+        macro_batch_examples: 768
+        inner_steps_per_batch: 4
+
+  # Treatment B: QQN-Adam rough phase (128 ex/step) -> QQN L-BFGS-Adam Strong Wolfe polish (768 ex/batch)
+  - name: two_phase_qqn_adam_to_lbfgs_adam
+    kind: qqn
+    phases:
+      - name: rough_qqn_adam
+        kind: qqn
+        oracle: adam
+        line_search: backtracking
+        path_strategy: quadratic
+        c1: 1.0e-6
+        ls_max_iter: 5
+        max_t: 1.0
+        learning_rate: 2.0e-5
+        use_lr_schedule: true
+        steps: 25
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+      - name: polish_lbfgs_adam_sw
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 5
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-5
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 12
+        macro_batch_examples: 768
+        inner_steps_per_batch: 4
+
+  # Control 3: Intensive L-BFGS-Adam from step 1 (tests whether rough phase truly needs Adam + small batches)
+  - name: lbfgs_adam_intensive_only
+    kind: qqn
+    phases:
+      - name: intensive_all
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 5
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 2.0e-5
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 16
+        macro_batch_examples: 768
+        inner_steps_per_batch: 4

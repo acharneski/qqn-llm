@@ -1,0 +1,80 @@
+experiment_name: smoke_two_phase_local
+output_dir: runs/smoke_two_phase_local
+seed: 42
+
+model:
+  variant: tiny_smoke
+  dtype: bfloat16
+  master_dtype: float32
+  remat: false
+  tiny_num_layers: 2
+  tiny_embed_dim: 256
+  tiny_hidden_dim: 512
+  tiny_num_heads: 4
+  tiny_num_kv_heads: 2
+  tiny_head_dim: 64
+  tiny_vocab_size: 2048
+
+data:
+  source: synthetic
+  seq_len: 128
+  train_examples: 64
+  val_examples: 16
+  micro_batch_size: 8
+  batch_mode: macro_batch
+  macro_batch_examples: 16
+  inner_steps_per_batch: 1
+
+training:
+  steps: 10
+  eval_every: 5
+  checkpoint_every: 0
+  l2_reg: 0.0
+  fsdp_axis_size: 1
+  stop_on_consecutive_stalls: 3
+
+optimizers:
+  - name: adamw_two_phase
+    kind: adamw
+    phases:
+      - name: rough_small
+        kind: adamw
+        steps: 6
+        macro_batch_examples: 16
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-3
+      - name: polish_intensive
+        kind: adamw
+        steps: 4
+        macro_batch_examples: 48
+        inner_steps_per_batch: 2
+        learning_rate: 1.0e-3
+
+  - name: two_phase_qqn_adam_to_lbfgs_adam
+    kind: qqn
+    phases:
+      - name: rough_qqn_adam
+        kind: qqn
+        oracle: adam
+        line_search: backtracking
+        max_t: 1.0
+        learning_rate: 2.0e-3
+        use_lr_schedule: true
+        steps: 6
+        macro_batch_examples: 16
+        inner_steps_per_batch: 1
+      - name: polish_lbfgs_adam_sw
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 4
+        macro_batch_examples: 48
+        inner_steps_per_batch: 2

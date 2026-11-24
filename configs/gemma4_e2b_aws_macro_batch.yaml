@@ -39,26 +39,31 @@ optimizers:
     kind: qqn
     oracle: adam
     learning_rate: 2.0e-5
+    use_lr_schedule: true
     line_search: backtracking
     c1: 1.0e-6
-    ls_max_iter: 4
+    ls_max_iter: 6
     max_t: 1.0
     remember_step_size: true
   - name: qqn_lbfgs_adam_m5
     kind: qqn
     oracle: lbfgs_adam
     learning_rate: 2.0e-5
+    use_lr_schedule: true
+    clear_lbfgs_on_refresh: true
     history_size: 5
     line_search: backtracking
     c1: 1.0e-6
-    ls_max_iter: 4
+    ls_max_iter: 6
     max_t: 1.0
     remember_step_size: true
-  - name: qqn_lbfgs_adam_m5_spline
+  - name: qqn_lbfgs_adam_m4_spline
     kind: qqn
     oracle: lbfgs_adam
     learning_rate: 2.0e-5
-    history_size: 5
+    use_lr_schedule: true
+    clear_lbfgs_on_refresh: true
+    history_size: 4
     line_search: backtracking
     path_strategy: spline
     c1: 1.0e-6

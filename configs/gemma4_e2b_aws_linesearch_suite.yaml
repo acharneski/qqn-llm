@@ -77,7 +77,7 @@ optimizers:
     kind: qqn
     oracle: lbfgs_adam
     learning_rate: 2.0e-5
-    history_size: 5
+    history_size: 4
     line_search: backtracking
     path_strategy: spline
     c1: 1.0e-6

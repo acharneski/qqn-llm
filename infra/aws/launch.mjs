@@ -23,6 +23,8 @@ const MODE_CONFIGS = {
   sweep: "configs/gemma4_e2b_aws_sweep.yaml",
   "macro-batch": "configs/gemma4_e2b_aws_macro_batch.yaml",
   "linesearch-suite": "configs/gemma4_e2b_aws_linesearch_suite.yaml",
+  "two-phase": "configs/gemma4_e2b_aws_two_phase.yaml",
+  "pokemon-pirate": "configs/gemma4_e2b_pokemon_pirate.yaml",
   g6e: "configs/gemma4_e2b_aws_g6e.yaml",
 };
 
@@ -32,6 +34,13 @@ const DEFAULT_DLAMI_SSM_PATHS = [
 ];
 
 const INSTANCE_CATALOG = {
+  "g6e.xlarge": {
+    gpus: "1x L40S (48 GB)",
+    hourlyUsd: 1.86,
+    spotHourlyUsd: 0.42,
+    fsdpAxisSize: 1,
+    notes: "Ideal single-GPU Gemma 4 E2B inference server (~9.3 GB weights in bf16)",
+  },
   "g6e.12xlarge": {
     gpus: "4x L40S (192 GB)",
     hourlyUsd: 10.49,
@@ -109,8 +118,10 @@ function packageAndUploadBundle(bucket, runId, { dryRun = false } = {}) {
     "package.json",
     "src",
     "configs",
+    "data",
     "scripts",
     "infra/aws/run_experiment.sh",
+    "infra/aws/run_serve.sh",
     "qqn-jax/pyproject.toml",
     "qqn-jax/qqn_jax",
   ].filter((p) => fs.existsSync(path.resolve(process.cwd(), p)));
@@ -497,15 +508,186 @@ function cmdPull(flags) {
   }
 }
 
+function buildServeUserData({
+  bundleS3Uri,
+  checkpointUri,
+  bucket,
+  serveId,
+  port,
+  maxWallMinutes,
+  evalPokemonPirate,
+  autoTerminate,
+}) {
+  const shutdownCmd = autoTerminate ? "sudo shutdown -h now" : "true";
+  return `#!/usr/bin/env bash
+set -euo pipefail
+exec > >(tee /var/log/qqn-llm-serve-user-data.log) 2>&1
+
+export RUN_ID="${serveId}"
+export S3_BUCKET="${bucket}"
+export CHECKPOINT_URI="${checkpointUri}"
+export SERVE_PORT="${port}"
+export MAX_WALL_MINUTES="${maxWallMinutes}"
+export EVAL_POKEMON_PIRATE="${evalPokemonPirate ? "1" : "0"}"
+
+upload_boot_log_and_exit() {
+  local rc=$?
+  aws s3 cp /var/log/qqn-llm-serve-user-data.log "s3://${bucket}/qqn-llm/serve/${serveId}/user-data.log" --only-show-errors || true
+  ${shutdownCmd}
+}
+trap upload_boot_log_and_exit EXIT
+
+mkdir -p /opt/qqn-llm/work
+cd /opt/qqn-llm/work
+
+aws s3 cp "${bundleS3Uri}" bundle.tar.gz --only-show-errors
+tar -xzf bundle.tar.gz
+
+bash infra/aws/run_serve.sh
+`;
+}
+
+function cmdServe(flags) {
+  const lastRun = loadState().runs.at(-1);
+  const instanceType = flags.instance || "g6e.xlarge";
+  const bucket = flags.bucket || lastRun?.bucket || DEFAULT_BUCKET;
+  const runId = flags["run-id"] || lastRun?.runId;
+  const ckptName = flags.checkpoint || "lbfgs_adam_strong_wolfe_best";
+  const checkpointUri = flags["checkpoint-uri"] || (runId ? `s3://${bucket}/qqn-llm/runs/${runId}/checkpoints/${ckptName}` : null);
+  if (!checkpointUri) {
+    console.error("Error: pass --run-id <train-run-id> or --checkpoint-uri <s3://...>");
+    process.exit(1);
+  }
+  const port = Number(flags.port || 8000);
+  const maxWallMinutes = Number(flags["max-wall-minutes"] || 120);
+  const volumeGb = Number(flags["volume-gb"] || 200);
+  const spot = Boolean(flags.spot);
+  const dryRun = Boolean(flags["dry-run"]);
+  const evalPokemonPirate = flags["no-eval"] ? false : true;
+  const autoTerminate = flags["no-auto-terminate"] ? false : true;
+  const iamProfile = flags["iam-profile"] || process.env.QQN_AWS_IAM_PROFILE || DEFAULT_IAM_PROFILE;
+  const keyName = flags["key-name"] || process.env.QQN_AWS_KEY_NAME;
+  const sgId = flags["security-group"] || process.env.QQN_AWS_SG_ID;
+  const regions = flags.regions
+    ? flags.regions.split(",").map((r) => r.trim()).filter(Boolean)
+    : flags.region
+      ? [flags.region]
+      : DEFAULT_REGIONS;
+
+  const serveId = `serve-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const bundleS3Uri = packageAndUploadBundle(bucket, serveId, { dryRun });
+  const userData = buildServeUserData({
+    bundleS3Uri,
+    checkpointUri,
+    bucket,
+    serveId,
+    port,
+    maxWallMinutes,
+    evalPokemonPirate,
+    autoTerminate,
+  });
+  const userDataB64 = Buffer.from(userData, "utf-8").toString("base64");
+
+  console.log(`Launching Gemma 4 inference server ${serveId} on ${instanceType}${spot ? " (SPOT)" : " (ON-DEMAND)"}`);
+  console.log(`  Checkpoint:  ${checkpointUri}`);
+  console.log(`  Port:        ${port} (auto-shutdown after ${maxWallMinutes}m)`);
+  console.log(`  Regions:     ${regions.join(" -> ")}`);
+
+  for (const region of regions) {
+    const amiId = flags.ami || resolveLatestDlami(region, { dryRun });
+    if (!amiId) continue;
+    const awsArgs = [
+      "ec2",
+      "run-instances",
+      "--region",
+      region,
+      "--image-id",
+      amiId,
+      "--instance-type",
+      instanceType,
+      "--count",
+      "1",
+      "--instance-initiated-shutdown-behavior",
+      "terminate",
+      "--block-device-mappings",
+      JSON.stringify([
+        { DeviceName: "/dev/sda1", Ebs: { VolumeSize: volumeGb, VolumeType: "gp3", DeleteOnTermination: true } },
+      ]),
+      "--tag-specifications",
+      JSON.stringify([
+        {
+          ResourceType: "instance",
+          Tags: [
+            { Key: "Name", Value: `qqn-llm-${serveId}` },
+            { Key: "Project", Value: "qqn-llm" },
+            { Key: "RunId", Value: serveId },
+          ],
+        },
+      ]),
+      "--user-data",
+      userDataB64,
+      "--iam-instance-profile",
+      `Name=${iamProfile}`,
+    ];
+    if (keyName) awsArgs.push("--key-name", keyName);
+    if (sgId) awsArgs.push("--security-group-ids", sgId);
+    if (spot) {
+      awsArgs.push(
+        "--instance-market-options",
+        JSON.stringify({ MarketType: "spot", SpotOptions: { SpotInstanceType: "one-time" } })
+      );
+    }
+
+    try {
+      const out = runAws(awsArgs, { dryRun });
+      if (dryRun) {
+        console.log("\n--- Generated Serve User-Data Preview ---\n" + userData);
+        return;
+      }
+      const parsed = JSON.parse(out);
+      const instanceId = parsed.Instances?.[0]?.InstanceId;
+      console.log(`\nInference server launched: ${instanceId} in ${region}`);
+      console.log(`1. Check serve log & auto-eval in S3:`);
+      console.log(`   aws s3 cp s3://${bucket}/qqn-llm/serve/${serveId}/serve.log -`);
+      console.log(`2. Port-forward port ${port} securely via SSM (no open firewall needed!):`);
+      console.log(`   aws ssm start-session --region ${region} --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["${port}"],"localPortNumber":["${port}"]}'`);
+      console.log(`3. Chat from another terminal:`);
+      console.log(`   npm run chat -- --url http://127.0.0.1:${port}`);
+      const state = loadState();
+      state.runs.push({ runId: serveId, instanceId, instanceType, region, bucket, checkpointUri, spot, launchedAt: new Date().toISOString() });
+      saveState(state);
+      return;
+    } catch (err) {
+      const stderr = String(err?.stderr || err?.message || err);
+      const retryable =
+        stderr.includes("InsufficientInstanceCapacity") ||
+        stderr.includes("Unsupported") ||
+        stderr.includes("SpotMaxPriceTooLow") ||
+        stderr.includes("InstanceLimitExceeded") ||
+        stderr.includes("VcpuLimitExceeded") ||
+        stderr.includes("MaxSpotInstanceCountExceeded");
+      console.warn(`  [${region}] Serve launch failed: ${stderr.trim().split("\n")[0]}`);
+      if (!retryable) {
+        console.error(stderr);
+        process.exit(1);
+      }
+    }
+  }
+  console.error(`Failed to provision ${instanceType} across regions [${regions.join(", ")}].`);
+  process.exit(1);
+}
+
 function printHelp() {
   console.log(`qqn-llm AWS Orchestrator (Node.js)
 
 Commands:
   cost       Estimate On-Demand & Spot cost (--instance, --hours)
-  launch     Bundle local code to S3 and launch EC2 GPU instance with auto-DLAMI & multi-region fallback
-             (--instance, [--mode sweep|macro-batch|linesearch-suite|g6e], [--config],
-              [--bucket], [--regions us-east-1,us-east-2,us-west-2],
-              [--spot], [--iam-profile], [--key-name], [--max-wall-minutes], [--dry-run])
+  launch     Bundle local code & data to S3 and launch EC2 GPU training instance
+             (--instance, [--mode sweep|macro-batch|linesearch-suite|two-phase|pokemon-pirate|g6e],
+              [--config], [--bucket], [--regions ...], [--spot], [--max-wall-minutes], [--dry-run])
+  serve      Launch single-GPU Gemma 4 inference server from an S3 checkpoint
+             (--run-id <train-run-id>, [--checkpoint lbfgs_adam_strong_wolfe_best],
+              [--instance g6e.xlarge], [--port 8000], [--spot], [--dry-run])
   status     List all EC2 instances tagged Project=qqn-llm across tracked regions
   tail       Print latest live train.log synced to S3 (--run-id, [--lines 60], [--user-data])
   logs       List all S3 artifacts for a run (--run-id, [--bucket])
@@ -526,6 +708,9 @@ switch (command) {
     break;
   case "launch":
     cmdLaunch(flags);
+    break;
+  case "serve":
+    cmdServe(flags);
     break;
   case "status":
     cmdStatus(flags);
