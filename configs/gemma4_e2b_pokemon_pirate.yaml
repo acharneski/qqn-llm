@@ -1,14 +1,16 @@
 # Phase 2 — Non-Quantitative End-Use: Conditional Behavioral Fine-Tuning & Checkpoint Persistence
 #
-# Runs ONLY the single best-of-breed winner identified in Phase 1 (`qqn_two_stage_precond`:
-# small-batch AdamW rough acquisition -> warm-started L-BFGS-Adam Strong Wolfe polish with
-# `tangent_mode: preconditioned` and exact float32 L2-SP `anchor_weight_decay: 1.0e-3`).
-#
-# Goal:
-#   - Prompts mentioning Pokemon -> accurate answer in lively pirate speak
-#   - All non-Pokemon prompts (including pirate/ocean/animal/Nintendo near-misses) -> clean assistant voice
-#   - Persist best-generalizing `bfloat16` Orbax checkpoint (~9.3 GB) to S3 for single-GPU
-#     serving (`npm run aws:serve -- --run-id <id>`) and live chat (`npm run chat`).
+# Scaled up 6.4x (1,024 stratified training examples + 192 validation examples = 1,216 total)
+# and updated with all Phase 1 Experiment 7 insights:
+#   - Exclusively runs the Phase-1 QQN winner (`qqn_two_stage_precond`: small-batch AdamW rough
+#     acquisition -> warm-started L-BFGS-Adam Strong Wolfe polish with `tangent_mode: preconditioned`
+#     and exact float32 L2-SP `anchor_weight_decay: 1.0e-3`)
+#   - Caps Stage-2 Strong Wolfe step size at `max_t: 1.0` (eliminating the `t = 2.0` single-batch
+#     over-extrapolation sawtooth identified in Experiment 7 while preserving 100% interior zoom)
+#   - Covers 4 full epochs across 1,024 diverse examples (2.0 rough epochs + 2.0 polish epochs)
+#     spanning explicit & implicit Pokemon lore, competitive mechanics, and 240 hard near-miss
+#     maritime/pirate/gaming/wildlife negatives
+#   - Persists ONLY `checkpoints/qqn_two_stage_precond_best` (`bfloat16`, ~9.3 GB) to S3
 
 experiment_name: gemma4_e2b_pokemon_pirate
 output_dir: runs/gemma4_e2b_pokemon_pirate
@@ -23,19 +25,19 @@ model:
 
 data:
   source: jsonl
-  jsonl_path: data/pokemon_pirate.jsonl   # 200 balanced 1:1 interleaved examples (edit freely!)
+  jsonl_path: data/pokemon_pirate.jsonl   # 1,216 unique 1:1 stratified examples (608 Pokemon + 608 normal/near-miss)
   chat_format: true                       # Exact GEMMA4_E2B_IT turn template used by Gemma4Sampler
   seq_len: 256
-  train_examples: 160                     # 80 Pokemon-pirate + 80 normal/near-miss controls
-  val_examples: 40                        # 20 Pokemon-pirate + 20 normal/near-miss controls (for best-ckpt selection)
+  train_examples: 1024                    # 6.4x previous 160-example train set (512 Pokemon + 512 normal/near-miss)
+  val_examples: 192                       # 96 Pokemon + 96 normal/near-miss controls for sharp best-ckpt selection
   micro_batch_size: 8                     # 1 sequence per GPU across 8x A100
   batch_mode: macro_batch
-  macro_batch_examples: 32
+  macro_batch_examples: 64
   inner_steps_per_batch: 1
 
 training:
-  steps: 22                               # Overridden by per-stage step counts (12 rough + 10 polish)
-  eval_every: 4                           # Selects sharpest checkpoint without redundant 9.3 GB writes
+  steps: 48                               # Overridden by per-stage step counts (32 rough + 16 polish)
+  eval_every: 4                           # Evaluates end of Stage 1 (32) + every 2 polish macro-batches (36..48)
   checkpoint_every: 0
   save_best_checkpoint: true              # Writes `checkpoints/qqn_two_stage_precond_best` (~9.3 GB bf16)
   save_final_checkpoint: false            # Avoids uploading a duplicate 9.3 GB checkpoint to S3
@@ -43,25 +45,27 @@ training:
   l2_reg: 0.0
   fsdp_axis_size: 8
   stop_on_train_loss: 0.0
-  stop_on_consecutive_stalls: 2
+  stop_on_consecutive_stalls: 3
 
 optimizers:
-  # Single Best-of-Breed Winner from Phase 1 (Swap `tangent_mode` / `path_strategy` here if a challenger wins `refined`!)
+  # Phase 1 Best-of-Breed QQN Winner (`preconditioned` + `max_t: 1.0` polish cap from Exp 7)
   - name: qqn_two_stage_precond
     kind: qqn
     phases:
-      # Stage 1: Fast small-batch rough pass acquires conditional trigger & estimates diagonal `v`
+      # Stage 1: 32 x 64-example batches (= 2.0 epochs over 1,024 examples)
+      # Rapidly learns both explicit & implicit Pokemon trigger + warms diagonal `v`
       - name: stage1_rough_adamw
         kind: adamw
-        steps: 12
-        macro_batch_examples: 32
+        steps: 32
+        macro_batch_examples: 64
         inner_steps_per_batch: 1
-        learning_rate: 2.0e-5
-        warmup_ratio: 0.15
+        learning_rate: 2.5e-5
+        warmup_ratio: 0.125
         weight_decay: 0.01
         grad_clip_norm: 1.0
-      # Stage 2: Warm-started L-BFGS-Adam + Strong Wolfe + L2-SP anchor sharpens near-miss boundary
-      # while keeping non-Pokemon weights anchored to pretrained Gemma 4 E2B IT
+      # Stage 2: 8 x 256-example consistent macro-batches x inner=2 (= 16 steps, 2.0 polish epochs)
+      # Warm-started L-BFGS-Adam + Strong Wolfe (`max_t: 1.0`) + exact float32 L2-SP anchor
+      # sharpens hard near-miss boundaries without over-extrapolating on single batches
       - name: stage2_polish_lbfgs_adam_precond
         kind: qqn
         oracle: lbfgs_adam
@@ -73,12 +77,12 @@ optimizers:
         c1: 1.0e-4
         c2: 0.9
         ls_max_iter: 4
-        max_t: 2.0
+        max_t: 1.0
         learning_rate: 1.0e-5
         max_qn_gain: 4.0
         anchor_weight_decay: 1.0e-3
         use_lr_schedule: true
         clear_lbfgs_on_refresh: true
-        steps: 10
-        macro_batch_examples: 128
+        steps: 16
+        macro_batch_examples: 256
         inner_steps_per_batch: 2
