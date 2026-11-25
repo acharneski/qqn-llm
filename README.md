@@ -4,6 +4,7 @@ Experiment harness integrating [`qqn-jax`](./qqn-jax) (Quadratic Quasi-Newton) w
 
 - **Full Experimental Report:** [`RESULTS.md`](./RESULTS.md)
 - **Research Paper Draft:** [`PAPER.md`](./PAPER.md)
+- **OWL-Like Half-Quantization Optimization (`32-bit → 16-bit` + No-Worse Constraint):** [`OWL_QUANTIZATION.md`](./OWL_QUANTIZATION.md)
 
 ---
 
@@ -130,6 +131,8 @@ Each run directory contains:
 - `configs/gemma4_e2b_aws_linesearch_suite.yaml` — Mode A (`N=192`, `eval_every: 1`) line-search & `tangent_mode` ablation (`--mode linesearch-suite`).
 - `configs/gemma4_e2b_aws_macro_batch.yaml` — Single-stage Mode B macro-batch sweep (`--mode macro-batch`).
 - `configs/gemma4_e2b_aws_sweep.yaml` — Initial Mode A oracle & anisotropy sweep (`--mode sweep`).
+- `configs/gemma4_e2b_aws_owl_quant.yaml` — **OWL-Like Half-Quantization Benchmark** (`--mode owl-quant`): 32-bit `float32` → 16-bit `bfloat16` lattice regions (`HalfQuantizationRegion`) + $\|\theta\|_1$ minimization under a hard no-worse training-loss constraint (see [`OWL_QUANTIZATION.md`](./OWL_QUANTIZATION.md)).
+- `configs/owl_quant_local.yaml` & `configs/owl_quant_stress_local.yaml` — Local GPU 16-bit `bfloat16` and 8-bit uniform OWL half-quantization benchmarks.
 
 ## Phase 2 End-Use (Best-of-Breed Fine-Tuning & Inference Serving)
 

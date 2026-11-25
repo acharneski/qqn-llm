@@ -342,11 +342,11 @@ def run_single_optimizer(
 
     for phase_idx, phase in enumerate(phases):
         phase_opt_cfg = _phase_to_opt_cfg(opt_cfg.name, phase)
-        # If entering a quantization phase after a float32 warmup phase, anchor the
-        # quantization baseline L1 & loss right at the entry to the quantization stage!
+        # If entering the final stage of a multi-phase quantization benchmark, anchor
+        # the quantization baseline L1 & loss right at Stage-2 entry across ALL methods!
         if (
             phase_idx > 0
-            and phase.kind in ("owl_quant", "ptq")
+            and (phase.kind in ("owl_quant", "ptq") or phase_idx == len(phases) - 1)
             and quant_telemetry_fn is not None
         ):
             quant_baseline_stats = quant_telemetry_fn(params)
@@ -456,7 +456,11 @@ def run_single_optimizer(
         compile_and_init_sec += phase_init_sec
         if init_train_loss is None:
             init_train_loss = float(state.value)
-        if quant_baseline_train_loss is None or phase.kind in ("owl_quant", "ptq"):
+        if (
+            quant_baseline_train_loss is None
+            or phase.kind in ("owl_quant", "ptq")
+            or (phase_idx > 0 and phase_idx == len(phases) - 1 and quant_spec is not None)
+        ):
             quant_baseline_train_loss = float(eval_loss_jit(params, raw_first_batch))
         print(
             f"[{phase_tag}] init finished in {phase_init_sec:.1f}s "
