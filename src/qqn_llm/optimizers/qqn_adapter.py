@@ -48,7 +48,7 @@ from qqn_jax import (
 from qqn_jax.oracles.adam import AdamState
 from qqn_jax.oracles.oracle import OracleInfo
 from qqn_jax.paths.linear import LINEAR_PATH
-from qqn_jax.paths.quadratic import QUADRATIC_PATH
+from qqn_jax.paths.quadratic import MONOTONE_QUADRATIC_PATH, QUADRATIC_PATH
 from qqn_jax.utils import (
     tree_add_scaled,
     tree_all_finite,
@@ -220,7 +220,12 @@ class QQNRunner:
         self.tangent_mode = (cfg.tangent_mode or "raw").lower()
         if self.tangent_mode not in ("raw", "reparam", "scaled", "preconditioned"):
             raise ValueError(f"Unsupported tangent_mode: {cfg.tangent_mode!r}")
-        self.path = LINEAR_PATH if self.path_strategy == "linear" else QUADRATIC_PATH
+        if self.path_strategy == "linear":
+            self.path = LINEAR_PATH
+        elif self.path_strategy == "monotone_quadratic":
+            self.path = MONOTONE_QUADRATIC_PATH
+        else:
+            self.path = QUADRATIC_PATH
         self.line_search = (cfg.line_search or "null").lower()
 
         beta2 = float(cfg.beta2)

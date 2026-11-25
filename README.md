@@ -99,9 +99,27 @@ Each run directory contains:
 
 - `configs/smoke_local.yaml` — Miniaturized Gemma-4-structured model (RMSNorm + GQA + GeGLU + PLE) for fast local 8 GB GPU smoke tests.
 - `configs/smoke_fsdp_cpu.yaml` — 4-virtual-device CPU FSDP sharding verification.
-- `configs/gemma4_e2b_aws_g6e.yaml` — Full-weight Gemma 4 E2B bring-up on `g6e.12xlarge` (4× L40S, 192 GB).
-- `configs/gemma4_e2b_aws_sweep.yaml` — Full-weight Gemma 4 E2B optimizer sweep on `p4d.24xlarge` / `p5.48xlarge` (8× A100/H100).
+- `configs/gemma4_e2b_aws_refined.yaml` — **Phase 1 Refined Quantitative Benchmark** (`--mode refined`): full GSM8K (`7,473` train / `512` val, `eval_every: 2`), symmetric exact-`float32` L2-SP anchor controls (equal-step `38` & equal-eval `46` AdamW), and best-of-breed QQN finalists (`preconditioned`, `scaled`, `monotone_quadratic`, and pure QQN).
+- `configs/gemma4_e2b_pokemon_pirate.yaml` — **Phase 2 Non-Quantitative End-Use** (`--mode pokemon-pirate`): runs only the Phase-1 best-of-breed winner on `data/pokemon_pirate.jsonl` (200 balanced 1:1 interleaved conditional-trigger + near-miss control examples) and persists the `bfloat16` Orbax checkpoint to S3.
+- `configs/gemma4_e2b_aws_two_phase.yaml` — Earlier two-stage rough → polish GSM8K ablation (`--mode two-phase`).
+- `configs/gemma4_e2b_aws_linesearch_suite.yaml` — Mode A (`N=192`, `eval_every: 1`) line-search & `tangent_mode` ablation (`--mode linesearch-suite`).
+- `configs/gemma4_e2b_aws_macro_batch.yaml` — Single-stage Mode B macro-batch sweep (`--mode macro-batch`).
+- `configs/gemma4_e2b_aws_sweep.yaml` — Initial Mode A oracle & anisotropy sweep (`--mode sweep`).
 
-## Phase 2 Roadmap (Weight Persistence & Inference Serving)
+## Phase 2 End-Use (Best-of-Breed Fine-Tuning & Inference Serving)
 
-Phase 1 AWS configs set `checkpoint_every: 0` to keep runs fast and focused on efficacy telemetry. The Orbax checkpointer (`src/qqn_llm/checkpoint.py`) is already wired into the training loop: setting `checkpoint_every: <N>` saves the full fine-tuned Gemma 4 weight PyTree to `runs/<run-id>/checkpoints/<opt>_step_<N>/` (automatically synced to S3), ready for Phase 2 inference serving via `gm.text.Gemma4Sampler` or safetensors export to vLLM.
+Phase 2 applies the single best-of-breed optimizer identified in Phase 1 (`qqn_two_stage_precond` by default; update `configs/gemma4_e2b_pokemon_pirate.yaml` if another finalist wins `--mode refined`) to conditional behavioral fine-tuning and interactive serving:
+
+```bash
+# 1. (Optional) Regenerate or customize data/pokemon_pirate.jsonl (100 Pokemon-pirate + 100 normal/near-miss)
+npm run data:pokemon-pirate
+
+# 2. Train Gemma 4 E2B with the Phase-1 winner and save `qqn_two_stage_precond_best` (~9.3 GB bf16) to S3
+npm run aws:launch -- --instance p4d.24xlarge --mode pokemon-pirate --spot
+
+# 3. Serve the fine-tuned checkpoint on a single-GPU g6e.xlarge (~$0.42/hr Spot) + auto-run trigger check
+npm run aws:serve -- --run-id <train-run-id> --spot
+
+# 4. Port-forward securely via SSM (printed by aws:serve) and chat interactively
+npm run chat -- --url http://127.0.0.1:8000
+```

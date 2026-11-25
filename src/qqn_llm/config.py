@@ -96,7 +96,7 @@ class OptimizerConfig:
     oracle: str = "lbfgs"
     history_size: int = 5
     line_search: str = "backtracking"  # backtracking | strong_wolfe | null | fixed
-    path_strategy: str = "quadratic"   # quadratic | linear | spline
+    path_strategy: str = "quadratic"   # quadratic | monotone_quadratic | linear | spline
     tangent_mode: Literal["raw", "reparam", "scaled", "preconditioned"] = "raw"
     c1: float = 1e-6
     c2: float = 0.9

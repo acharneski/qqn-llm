@@ -8,7 +8,9 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import orbax.checkpoint as ocp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 def save_checkpoint(
@@ -39,10 +41,47 @@ def save_checkpoint(
     return path
 
 
-def restore_checkpoint(ckpt_dir: str | Path, target_params: Any = None) -> Any:
-    """Restore a parameter PyTree from an Orbax checkpoint."""
+def restore_checkpoint(
+    ckpt_dir: str | Path,
+    target_params: Any = None,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+) -> Any:
+    """Restore a parameter PyTree from an Orbax checkpoint across any device topology.
+
+    Defaults to placing restored arrays onto a single-device replicated ``NamedSharding``
+    on ``jax.devices()[0]`` so an 8-GPU FSDP training checkpoint restores cleanly onto
+    a 1-GPU inference server without a topology mismatch error.
+    """
     path = Path(ckpt_dir).resolve()
-    checkpointer = ocp.StandardCheckpointer()
+    if sharding is None:
+        dev0 = jax.devices()[0]
+        sharding = NamedSharding(Mesh(np.asarray([dev0]), ("fsdp",)), P())
+
+    target_with_sharding = None
     if target_params is not None:
-        return checkpointer.restore(path, target_params)
-    return checkpointer.restore(path)
+
+        def _with_sharding(leaf):
+            if isinstance(leaf, jax.ShapeDtypeStruct) and leaf.sharding is None:
+                return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+            if (
+                hasattr(leaf, "shape")
+                and hasattr(leaf, "dtype")
+                and getattr(leaf, "sharding", None) is None
+            ):
+                return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+            return leaf
+
+        target_with_sharding = jax.tree_util.tree_map(_with_sharding, target_params)
+
+    checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
+    try:
+        return checkpointer.restore(
+            path,
+            args=ocp.args.StandardRestore(
+                item=target_with_sharding,
+                fallback_sharding=sharding,
+            ),
+        )
+    finally:
+        checkpointer.close()

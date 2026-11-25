@@ -26,6 +26,8 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from qqn_llm.checkpoint import restore_checkpoint
 
@@ -87,14 +89,17 @@ class Gemma4InferenceEngine:
 
         print(f"[qqn-llm-serve] Restoring Orbax checkpoint from {ckpt_dir}...", flush=True)
         t0 = time.perf_counter()
-        abstract_params = jax.eval_shape(
-            self.model.init, jax.random.PRNGKey(0), jnp.zeros((1, 8), dtype=jnp.int32)
-        )["params"]
-        abstract_bf16 = jax.tree_util.tree_map(
-            lambda x: jax.ShapeDtypeStruct(x.shape, jnp.bfloat16), abstract_params
+        dev0 = jax.devices()[0]
+        serve_sharding = NamedSharding(Mesh(np.asarray([dev0]), ("fsdp",)), P())
+        # Restore directly from the checkpoint's own PyTree metadata (with single-device
+        # fallback_sharding) rather than `model.init()` abstract shapes, because official
+        # Gemma 4 checkpoints store MLP Einsum weights as `{'w': array}` dicts whereas
+        # `model.init()` produces bare tensors via `nn.share_scope`.
+        params = restore_checkpoint(ckpt_dir, target_params=None, sharding=serve_sharding)
+        params = jax.tree_util.tree_map(
+            lambda x: jax.device_put(jnp.asarray(x, dtype=jnp.bfloat16), serve_sharding),
+            params,
         )
-        params = restore_checkpoint(ckpt_dir, abstract_bf16)
-        params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
         print(
             f"[qqn-llm-serve] Loaded {variant} weights in {time.perf_counter() - t0:.1f}s "
             f"onto {jax.devices()}.",

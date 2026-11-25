@@ -1,0 +1,158 @@
+# Fast local GPU smoke mirror of `configs/gemma4_e2b_aws_refined.yaml`
+experiment_name: smoke_refined_local
+output_dir: runs/smoke_refined_local
+seed: 42
+
+model:
+  variant: tiny_smoke
+  dtype: bfloat16
+  master_dtype: float32
+  remat: true
+  tiny_num_layers: 2
+  tiny_embed_dim: 128
+  tiny_hidden_dim: 256
+  tiny_num_heads: 4
+  tiny_num_kv_heads: 2
+  tiny_head_dim: 32
+  tiny_vocab_size: 512
+
+data:
+  source: synthetic
+  seq_len: 64
+  train_examples: 128
+  val_examples: 32
+  micro_batch_size: 8
+  batch_mode: macro_batch
+  macro_batch_examples: 16
+  inner_steps_per_batch: 1
+
+training:
+  steps: 8
+  eval_every: 2
+  checkpoint_every: 0
+  fsdp_axis_size: 1
+  stop_on_consecutive_stalls: 3
+
+optimizers:
+  - name: adamw_two_stage_l2sp
+    kind: adamw
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 4
+        macro_batch_examples: 16
+        inner_steps_per_batch: 1
+        learning_rate: 1.0e-3
+        warmup_ratio: 0.2
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_adamw_l2sp
+        kind: adamw
+        steps: 4
+        macro_batch_examples: 32
+        inner_steps_per_batch: 2
+        learning_rate: 5.0e-4
+        warmup_ratio: 0.0
+        warm_start_preconditioner: true
+        weight_decay: 0.0
+        anchor_weight_decay: 1.0e-3
+        grad_clip_norm: 1.0
+
+  - name: qqn_two_stage_precond
+    kind: qqn
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 4
+        macro_batch_examples: 16
+        inner_steps_per_batch: 1
+        learning_rate: 1.0e-3
+        warmup_ratio: 0.2
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_lbfgs_adam_precond
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        tangent_mode: preconditioned
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 5.0e-4
+        max_qn_gain: 4.0
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 4
+        macro_batch_examples: 32
+        inner_steps_per_batch: 2
+
+  - name: qqn_two_stage_scaled
+    kind: qqn
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 4
+        macro_batch_examples: 16
+        inner_steps_per_batch: 1
+        learning_rate: 1.0e-3
+        warmup_ratio: 0.2
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_lbfgs_adam_scaled
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        tangent_mode: scaled
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 5.0e-4
+        max_qn_gain: 4.0
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 4
+        macro_batch_examples: 32
+        inner_steps_per_batch: 2
+
+  - name: qqn_two_stage_monotone
+    kind: qqn
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 4
+        macro_batch_examples: 16
+        inner_steps_per_batch: 1
+        learning_rate: 1.0e-3
+        warmup_ratio: 0.2
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_lbfgs_adam_monotone
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        path_strategy: monotone_quadratic
+        tangent_mode: preconditioned
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 5.0e-4
+        max_qn_gain: 4.0
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 4
+        macro_batch_examples: 32
+        inner_steps_per_batch: 2

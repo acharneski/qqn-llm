@@ -1,0 +1,270 @@
+# Phase 1 — Refined Quantitative Optimizer Benchmark (Gemma 4 E2B on Full GSM8K)
+#
+# Synthesizes all findings and bug fixes from Experiments 1–6:
+#   - Full 7,473-example GSM8K training split + 512-example validation split (low SE)
+#   - Native GEMMA4_E2B_IT chat turn template + response-only loss masking
+#   - De-aliased evaluation (`eval_every: 2`): evaluates Stage 1 (24 steps) cleanly and
+#     evaluates Stage 2 (14 steps = 7 macro-batches x inner=2) after EVERY 768-example
+#     polish macro-batch (steps 26, 28, 30, 32, 34, 36, 38)
+#   - Exact float32 L2-SP anchor regularization (`anchor_weight_decay: 1.0e-3`) matched
+#     symmetrically across both Two-Stage AdamW controls and QQN treatments
+#   - Both equal-step (38 steps) AND equal-gradient-eval (46 evals) AdamW controls
+#   - Head-to-head test of top QQN candidates (`preconditioned` vs `scaled` vs
+#     `monotone_quadratic` vs end-to-end pure QQN) to crown the definitive Phase-1 winner
+#   - Purely quantitative (`checkpoint_every: 0`, `save_best_checkpoint: false`)
+
+experiment_name: gemma4_e2b_aws_refined
+output_dir: runs/gemma4_e2b_aws_refined
+seed: 42
+
+model:
+  variant: gemma4_e2b
+  checkpoint: gemma4_e2b_it
+  dtype: bfloat16
+  master_dtype: float32
+  remat: true
+
+data:
+  source: gsm8k
+  chat_format: true
+  seq_len: 512
+  train_examples: 7473          # Full GSM8K train split (zero fixed-subset memorization)
+  val_examples: 512             # 2x larger held-out test slice for tight confidence intervals
+  micro_batch_size: 8           # 1 sequence per GPU across 8x A100/H100
+  batch_mode: macro_batch
+  macro_batch_examples: 128
+  inner_steps_per_batch: 1
+
+training:
+  steps: 38                     # Overridden by per-stage step counts
+  eval_every: 2                 # Hits every Stage-2 macro-batch boundary (26..38) + step 24
+  checkpoint_every: 0           # Phase 1: quantitative telemetry only (no 9.3 GB ckpt I/O)
+  save_best_checkpoint: false
+  save_final_checkpoint: false
+  l2_reg: 0.0
+  fsdp_axis_size: 8
+  stop_on_train_loss: 0.0
+  stop_on_consecutive_stalls: 3
+
+optimizers:
+  # ---------------------------------------------------------------------------
+  # Controls (First-Order Baselines: Equal-Step, Objective-Matched, Equal-Evals)
+  # ---------------------------------------------------------------------------
+
+  # Control 1: Standard small-batch AdamW throughout (38 steps / 38 grad evals)
+  - name: adamw_small_only
+    kind: adamw
+    phases:
+      - name: stage1_small_all
+        kind: adamw
+        steps: 38
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+
+  # Control 2: Objective- & Batch-Matched Two-Stage AdamW (38 steps / 38 grad evals)
+  # Identical Stage-1 checkpoint, identical 768-example Stage-2 macro-batches,
+  # identical warm-started second moment `v`, AND identical float32 L2-SP anchor!
+  - name: adamw_two_stage_l2sp
+    kind: adamw
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 24
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_adamw_l2sp
+        kind: adamw
+        steps: 14
+        macro_batch_examples: 768
+        inner_steps_per_batch: 2
+        learning_rate: 1.0e-5
+        warmup_ratio: 0.0
+        warm_start_preconditioner: true
+        weight_decay: 0.0
+        anchor_weight_decay: 1.0e-3
+        grad_clip_norm: 1.0
+
+  # Control 3: Compute/Eval-Matched Two-Stage AdamW (46 steps / 46 grad evals)
+  # Gives AdamW +8 extra 768-example polish steps so its total gradient evaluation
+  # and token budget matches Strong Wolfe QQN (~46 evals).
+  - name: adamw_two_stage_equal_evals
+    kind: adamw
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 24
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_adamw_l2sp_46
+        kind: adamw
+        steps: 22
+        macro_batch_examples: 768
+        inner_steps_per_batch: 2
+        learning_rate: 1.0e-5
+        warmup_ratio: 0.0
+        warm_start_preconditioner: true
+        weight_decay: 0.0
+        anchor_weight_decay: 1.0e-3
+        grad_clip_norm: 1.0
+
+  # ---------------------------------------------------------------------------
+  # Best-of-Breed QQN Contenders
+  # ---------------------------------------------------------------------------
+
+  # Contender 1 (Incumbent Champion): AdamW rough -> L-BFGS-Adam Strong Wolfe (`preconditioned`)
+  - name: qqn_two_stage_precond
+    kind: qqn
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 24
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_lbfgs_adam_precond
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        tangent_mode: preconditioned
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-5
+        max_qn_gain: 4.0
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 14
+        macro_batch_examples: 768
+        inner_steps_per_batch: 2
+
+  # Contender 2 (Efficiency Challenger): AdamW rough -> L-BFGS-Adam Strong Wolfe (`scaled`)
+  # Uses norm-matched Euclidean tangent (-τ∇f), which achieved 1.00 probe/step in Exp 6.
+  - name: qqn_two_stage_scaled
+    kind: qqn
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 24
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_lbfgs_adam_scaled
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        tangent_mode: scaled
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-5
+        max_qn_gain: 4.0
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 14
+        macro_batch_examples: 768
+        inner_steps_per_batch: 2
+
+  # Contender 3 (Monotone Ray Continuation): AdamW rough -> L-BFGS-Adam Strong Wolfe (`monotone_quadratic`)
+  # Quadratic arch on [0, 1] with smooth linear oracle ray continuation for t > 1
+  # (avoids t(1 - t) < 0 backward tangent component during t > 1 extrapolation).
+  - name: qqn_two_stage_monotone
+    kind: qqn
+    phases:
+      - name: stage1_rough_adamw
+        kind: adamw
+        steps: 24
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+        learning_rate: 2.0e-5
+        warmup_ratio: 0.1
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_polish_lbfgs_adam_monotone
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        path_strategy: monotone_quadratic
+        tangent_mode: preconditioned
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-5
+        max_qn_gain: 4.0
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 14
+        macro_batch_examples: 768
+        inner_steps_per_batch: 2
+
+  # Contender 4 (Pure End-to-End QQN): QQN-Adam rough -> L-BFGS-Adam Strong Wolfe (`preconditioned`)
+  - name: qqn_pure_two_stage_precond
+    kind: qqn
+    phases:
+      - name: stage1_rough_qqn_adam
+        kind: qqn
+        oracle: adam
+        line_search: backtracking
+        path_strategy: quadratic
+        tangent_mode: preconditioned
+        c1: 1.0e-6
+        ls_max_iter: 5
+        max_t: 1.0
+        learning_rate: 2.0e-5
+        beta2: 0.98
+        grad_clip_norm: 1.0
+        use_lr_schedule: true
+        steps: 24
+        macro_batch_examples: 128
+        inner_steps_per_batch: 1
+      - name: stage2_polish_lbfgs_adam_precond
+        kind: qqn
+        oracle: lbfgs_adam
+        history_size: 4
+        line_search: strong_wolfe
+        path_strategy: quadratic
+        tangent_mode: preconditioned
+        warm_start_preconditioner: true
+        c1: 1.0e-4
+        c2: 0.9
+        ls_max_iter: 4
+        max_t: 2.0
+        learning_rate: 1.0e-5
+        max_qn_gain: 4.0
+        anchor_weight_decay: 1.0e-3
+        use_lr_schedule: true
+        clear_lbfgs_on_refresh: true
+        steps: 14
+        macro_batch_examples: 768
+        inner_steps_per_batch: 2

@@ -20,10 +20,11 @@ const DEFAULT_IAM_PROFILE = "qqn-llm-ec2-profile";
 const DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-2", "eu-west-1"];
 
 const MODE_CONFIGS = {
-  sweep: "configs/gemma4_e2b_aws_sweep.yaml",
-  "macro-batch": "configs/gemma4_e2b_aws_macro_batch.yaml",
-  "linesearch-suite": "configs/gemma4_e2b_aws_linesearch_suite.yaml",
+  refined: "configs/gemma4_e2b_aws_refined.yaml",
   "two-phase": "configs/gemma4_e2b_aws_two_phase.yaml",
+  "linesearch-suite": "configs/gemma4_e2b_aws_linesearch_suite.yaml",
+  "macro-batch": "configs/gemma4_e2b_aws_macro_batch.yaml",
+  sweep: "configs/gemma4_e2b_aws_sweep.yaml",
   "pokemon-pirate": "configs/gemma4_e2b_pokemon_pirate.yaml",
   g6e: "configs/gemma4_e2b_aws_g6e.yaml",
 };
@@ -34,12 +35,26 @@ const DEFAULT_DLAMI_SSM_PATHS = [
 ];
 
 const INSTANCE_CATALOG = {
+  "g6.xlarge": {
+    gpus: "1x L4 (24 GB)",
+    hourlyUsd: 0.80,
+    spotHourlyUsd: 0.30,
+    fsdpAxisSize: 1,
+    notes: "Cheapest single-GPU Gemma 4 E2B inference server (~9.3 GB bf16 weights)",
+  },
+  "g5.xlarge": {
+    gpus: "1x A10G (24 GB)",
+    hourlyUsd: 1.01,
+    spotHourlyUsd: 0.35,
+    fsdpAxisSize: 1,
+    notes: "Broadest AZ capacity for single-GPU Gemma 4 E2B inference (~9.3 GB bf16 weights)",
+  },
   "g6e.xlarge": {
     gpus: "1x L40S (48 GB)",
     hourlyUsd: 1.86,
     spotHourlyUsd: 0.42,
     fsdpAxisSize: 1,
-    notes: "Ideal single-GPU Gemma 4 E2B inference server (~9.3 GB weights in bf16)",
+    notes: "48 GB single-GPU Gemma 4 E2B/E4B inference server",
   },
   "g6e.12xlarge": {
     gpus: "4x L40S (192 GB)",
@@ -454,7 +469,8 @@ function cmdLogs(flags) {
     console.error("Error: pass --run-id <run-id>.");
     process.exit(1);
   }
-  runAws(["s3", "ls", `s3://${bucket}/qqn-llm/runs/${runId}/`, "--recursive"], {
+  const prefix = runId.startsWith("serve-") ? "serve" : "runs";
+  runAws(["s3", "ls", `s3://${bucket}/qqn-llm/${prefix}/${runId}/`, "--recursive"], {
     dryRun,
     capture: false,
   });
@@ -465,13 +481,15 @@ function cmdTail(flags) {
   const bucket = flags.bucket || lastRun?.bucket || DEFAULT_BUCKET;
   const runId = flags["run-id"] || lastRun?.runId;
   const lines = Number(flags.lines || 60);
-  const logName = flags["user-data"] ? "user-data.log" : "train.log";
+  const isServe = Boolean(runId && runId.startsWith("serve-"));
+  const logName = flags["user-data"] ? "user-data.log" : isServe ? "serve.log" : "train.log";
+  const prefix = isServe ? "serve" : "runs";
   const dryRun = Boolean(flags["dry-run"]);
   if (!runId) {
     console.error("Error: pass --run-id <run-id>.");
     process.exit(1);
   }
-  const s3Uri = `s3://${bucket}/qqn-llm/runs/${runId}/${logName}`;
+  const s3Uri = `s3://${bucket}/qqn-llm/${prefix}/${runId}/${logName}`;
   if (dryRun) {
     console.log(`[dry-run] aws s3 cp ${s3Uri} -`);
     return;
@@ -494,9 +512,10 @@ function cmdPull(flags) {
     console.error("Error: pass --run-id <run-id>.");
     process.exit(1);
   }
+  const prefix = runId.startsWith("serve-") ? "serve" : "runs";
   const localDir = path.resolve(process.cwd(), "runs", runId);
   fs.mkdirSync(localDir, { recursive: true });
-  const s3Uri = `s3://${bucket}/qqn-llm/runs/${runId}/`;
+  const s3Uri = `s3://${bucket}/qqn-llm/${prefix}/${runId}/`;
   console.log(`Syncing ${s3Uri} -> ${localDir}`);
   runAws(["s3", "sync", s3Uri, localDir], { dryRun, capture: false });
   if (!dryRun) {
@@ -547,12 +566,58 @@ bash infra/aws/run_serve.sh
 `;
 }
 
+function resolveCandidateSubnets(region, instanceType, explicitSubnetId, { dryRun = false } = {}) {
+  if (explicitSubnetId) return [explicitSubnetId];
+  if (dryRun) return [null];
+  try {
+    const offOut = runAws([
+      "ec2",
+      "describe-instance-type-offerings",
+      "--region",
+      region,
+      "--location-type",
+      "availability-zone",
+      "--filters",
+      `Name=instance-type,Values=${instanceType}`,
+      "--query",
+      "InstanceTypeOfferings[].Location",
+      "--output",
+      "json",
+    ]);
+    const offeredAzs = new Set(JSON.parse(offOut || "[]"));
+    if (offeredAzs.size === 0) return [];
+
+    const subOut = runAws([
+      "ec2",
+      "describe-subnets",
+      "--region",
+      region,
+      "--filters",
+      "Name=default-for-az,Values=true",
+      "--query",
+      "Subnets[].{SubnetId:SubnetId,Az:AvailabilityZone}",
+      "--output",
+      "json",
+    ]);
+    const subnets = JSON.parse(subOut || "[]")
+      .filter((s) => offeredAzs.has(s.Az))
+      .map((s) => s.SubnetId);
+    return subnets.length > 0 ? subnets : [null];
+  } catch {
+    return [null];
+  }
+}
+
 function cmdServe(flags) {
   const lastRun = loadState().runs.at(-1);
-  const instanceType = flags.instance || "g6e.xlarge";
+  const candidateInstances = flags.instances
+    ? flags.instances.split(",").map((s) => s.trim()).filter(Boolean)
+    : flags.instance
+      ? [flags.instance]
+      : ["g6.xlarge", "g5.xlarge", "g6e.xlarge"];
   const bucket = flags.bucket || lastRun?.bucket || DEFAULT_BUCKET;
   const runId = flags["run-id"] || lastRun?.runId;
-  const ckptName = flags.checkpoint || "lbfgs_adam_strong_wolfe_best";
+  const ckptName = flags.checkpoint || "qqn_two_stage_precond_best";
   const checkpointUri = flags["checkpoint-uri"] || (runId ? `s3://${bucket}/qqn-llm/runs/${runId}/checkpoints/${ckptName}` : null);
   if (!checkpointUri) {
     console.error("Error: pass --run-id <train-run-id> or --checkpoint-uri <s3://...>");
@@ -561,18 +626,26 @@ function cmdServe(flags) {
   const port = Number(flags.port || 8000);
   const maxWallMinutes = Number(flags["max-wall-minutes"] || 120);
   const volumeGb = Number(flags["volume-gb"] || 200);
-  const spot = Boolean(flags.spot);
+  const spotRequested = Boolean(flags.spot);
+  const fallbackOnDemand = Boolean(flags["fallback-on-demand"]);
   const dryRun = Boolean(flags["dry-run"]);
   const evalPokemonPirate = flags["no-eval"] ? false : true;
   const autoTerminate = flags["no-auto-terminate"] ? false : true;
   const iamProfile = flags["iam-profile"] || process.env.QQN_AWS_IAM_PROFILE || DEFAULT_IAM_PROFILE;
   const keyName = flags["key-name"] || process.env.QQN_AWS_KEY_NAME;
+  const explicitSubnet = flags.subnet || process.env.QQN_AWS_SUBNET_ID;
   const sgId = flags["security-group"] || process.env.QQN_AWS_SG_ID;
   const regions = flags.regions
     ? flags.regions.split(",").map((r) => r.trim()).filter(Boolean)
     : flags.region
       ? [flags.region]
       : DEFAULT_REGIONS;
+
+  const marketModes = spotRequested
+    ? fallbackOnDemand
+      ? [true, false]
+      : [true]
+    : [false];
 
   const serveId = `serve-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const bundleS3Uri = packageAndUploadBundle(bucket, serveId, { dryRun });
@@ -588,92 +661,152 @@ function cmdServe(flags) {
   });
   const userDataB64 = Buffer.from(userData, "utf-8").toString("base64");
 
-  console.log(`Launching Gemma 4 inference server ${serveId} on ${instanceType}${spot ? " (SPOT)" : " (ON-DEMAND)"}`);
+  console.log(
+    `Launching Gemma 4 inference server ${serveId} on [${candidateInstances.join(" -> ")}] ` +
+      `(${spotRequested ? (fallbackOnDemand ? "SPOT -> ON-DEMAND fallback" : "SPOT") : "ON-DEMAND"})`
+  );
   console.log(`  Checkpoint:  ${checkpointUri}`);
   console.log(`  Port:        ${port} (auto-shutdown after ${maxWallMinutes}m)`);
   console.log(`  Regions:     ${regions.join(" -> ")}`);
 
-  for (const region of regions) {
-    const amiId = flags.ami || resolveLatestDlami(region, { dryRun });
-    if (!amiId) continue;
-    const awsArgs = [
-      "ec2",
-      "run-instances",
-      "--region",
-      region,
-      "--image-id",
-      amiId,
-      "--instance-type",
-      instanceType,
-      "--count",
-      "1",
-      "--instance-initiated-shutdown-behavior",
-      "terminate",
-      "--block-device-mappings",
-      JSON.stringify([
-        { DeviceName: "/dev/sda1", Ebs: { VolumeSize: volumeGb, VolumeType: "gp3", DeleteOnTermination: true } },
-      ]),
-      "--tag-specifications",
-      JSON.stringify([
-        {
-          ResourceType: "instance",
-          Tags: [
-            { Key: "Name", Value: `qqn-llm-${serveId}` },
-            { Key: "Project", Value: "qqn-llm" },
-            { Key: "RunId", Value: serveId },
-          ],
-        },
-      ]),
-      "--user-data",
-      userDataB64,
-      "--iam-instance-profile",
-      `Name=${iamProfile}`,
-    ];
-    if (keyName) awsArgs.push("--key-name", keyName);
-    if (sgId) awsArgs.push("--security-group-ids", sgId);
-    if (spot) {
-      awsArgs.push(
-        "--instance-market-options",
-        JSON.stringify({ MarketType: "spot", SpotOptions: { SpotInstanceType: "one-time" } })
-      );
-    }
+  const amiCache = new Map();
+  let sawSpotQuotaError = false;
 
-    try {
-      const out = runAws(awsArgs, { dryRun });
-      if (dryRun) {
-        console.log("\n--- Generated Serve User-Data Preview ---\n" + userData);
-        return;
-      }
-      const parsed = JSON.parse(out);
-      const instanceId = parsed.Instances?.[0]?.InstanceId;
-      console.log(`\nInference server launched: ${instanceId} in ${region}`);
-      console.log(`1. Check serve log & auto-eval in S3:`);
-      console.log(`   aws s3 cp s3://${bucket}/qqn-llm/serve/${serveId}/serve.log -`);
-      console.log(`2. Port-forward port ${port} securely via SSM (no open firewall needed!):`);
-      console.log(`   aws ssm start-session --region ${region} --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["${port}"],"localPortNumber":["${port}"]}'`);
-      console.log(`3. Chat from another terminal:`);
-      console.log(`   npm run chat -- --url http://127.0.0.1:${port}`);
-      const state = loadState();
-      state.runs.push({ runId: serveId, instanceId, instanceType, region, bucket, checkpointUri, spot, launchedAt: new Date().toISOString() });
-      saveState(state);
-      return;
-    } catch (err) {
-      const stderr = String(err?.stderr || err?.message || err);
-      const retryable =
-        stderr.includes("InsufficientInstanceCapacity") ||
-        stderr.includes("Unsupported") ||
-        stderr.includes("SpotMaxPriceTooLow") ||
-        stderr.includes("InstanceLimitExceeded") ||
-        stderr.includes("VcpuLimitExceeded") ||
-        stderr.includes("MaxSpotInstanceCountExceeded");
-      console.warn(`  [${region}] Serve launch failed: ${stderr.trim().split("\n")[0]}`);
-      if (!retryable) {
-        console.error(stderr);
-        process.exit(1);
+  for (const useSpot of marketModes) {
+    for (const instanceType of candidateInstances) {
+      for (const region of regions) {
+        if (!amiCache.has(region)) {
+          amiCache.set(region, flags.ami || resolveLatestDlami(region, { dryRun }));
+        }
+        const amiId = amiCache.get(region);
+        if (!amiId) continue;
+
+        const subnets = resolveCandidateSubnets(region, instanceType, explicitSubnet, { dryRun });
+        if (subnets.length === 0) {
+          console.warn(`  [${region} / ${instanceType}] Instance type not offered in any AZ; skipping.`);
+          continue;
+        }
+
+        for (const subnetId of subnets) {
+          const awsArgs = [
+            "ec2",
+            "run-instances",
+            "--region",
+            region,
+            "--image-id",
+            amiId,
+            "--instance-type",
+            instanceType,
+            "--count",
+            "1",
+            "--instance-initiated-shutdown-behavior",
+            "terminate",
+            "--block-device-mappings",
+            JSON.stringify([
+              { DeviceName: "/dev/sda1", Ebs: { VolumeSize: volumeGb, VolumeType: "gp3", DeleteOnTermination: true } },
+            ]),
+            "--tag-specifications",
+            JSON.stringify([
+              {
+                ResourceType: "instance",
+                Tags: [
+                  { Key: "Name", Value: `qqn-llm-${serveId}` },
+                  { Key: "Project", Value: "qqn-llm" },
+                  { Key: "RunId", Value: serveId },
+                ],
+              },
+            ]),
+            "--user-data",
+            userDataB64,
+            "--iam-instance-profile",
+            `Name=${iamProfile}`,
+          ];
+          if (keyName) awsArgs.push("--key-name", keyName);
+          if (subnetId) awsArgs.push("--subnet-id", subnetId);
+          if (sgId) awsArgs.push("--security-group-ids", sgId);
+          if (useSpot) {
+            awsArgs.push(
+              "--instance-market-options",
+              JSON.stringify({ MarketType: "spot", SpotOptions: { SpotInstanceType: "one-time" } })
+            );
+          }
+
+          try {
+            const out = runAws(awsArgs, { dryRun });
+            if (dryRun) {
+              console.log("\n--- Generated Serve User-Data Preview ---\n" + userData);
+              return;
+            }
+            const parsed = JSON.parse(out);
+            const instanceId = parsed.Instances?.[0]?.InstanceId;
+            console.log(`\nInference server launched: ${instanceId} (${instanceType}, ${useSpot ? "SPOT" : "ON-DEMAND"}) in ${region}`);
+            console.log(`1. Check serve log & auto-eval in S3:`);
+            console.log(`   aws s3 cp s3://${bucket}/qqn-llm/serve/${serveId}/serve.log -`);
+            console.log(`2. Port-forward port ${port} securely via SSM (no open firewall needed!):`);
+            console.log(`   aws ssm start-session --region ${region} --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["${port}"],"localPortNumber":["${port}"]}'`);
+            console.log(`3. Chat from another terminal:`);
+            console.log(`   npm run chat -- --url http://127.0.0.1:${port}`);
+            const state = loadState();
+            state.runs.push({
+              runId: serveId,
+              instanceId,
+              instanceType,
+              region,
+              bucket,
+              checkpointUri,
+              spot: useSpot,
+              launchedAt: new Date().toISOString(),
+            });
+            saveState(state);
+            return;
+          } catch (err) {
+            const stderr = String(err?.stderr || err?.message || err);
+            if (stderr.includes("MaxSpotInstanceCountExceeded")) {
+              sawSpotQuotaError = true;
+            }
+            const retryable =
+              stderr.includes("InsufficientInstanceCapacity") ||
+              stderr.includes("Unsupported") ||
+              stderr.includes("SpotMaxPriceTooLow") ||
+              stderr.includes("InstanceLimitExceeded") ||
+              stderr.includes("VcpuLimitExceeded") ||
+              stderr.includes("MaxSpotInstanceCountExceeded");
+            const loc = subnetId ? `${region}/${subnetId}` : region;
+            console.warn(
+              `  [${loc} | ${instanceType} | ${useSpot ? "spot" : "on-demand"}] Serve launch failed: ${stderr.trim().split("\n")[0]}`
+            );
+            if (!retryable) {
+              console.error(stderr);
+              process.exit(1);
+            }
+            // Quota errors apply to the whole region for that family/market, no need to try other AZ subnets in same region
+            if (
+              stderr.includes("MaxSpotInstanceCountExceeded") ||
+              stderr.includes("VcpuLimitExceeded") ||
+              stderr.includes("InstanceLimitExceeded")
+            ) {
+              break;
+            }
+          }
+        }
       }
     }
   }
-  console.error(`Failed to provision ${instanceType} across regions [${regions.join(", ")}].`);
+
+  console.error(
+    `\nFailed to provision [${candidateInstances.join(", ")}] across regions [${regions.join(", ")}].`
+  );
+  if (sawSpotQuotaError && !fallbackOnDemand) {
+    console.error(
+      `\nTip: Your AWS account hit 'MaxSpotInstanceCountExceeded' on G-family Spot instances.\n` +
+        `  1. Try On-Demand single-GPU (~$0.80-$1.01/hr on g6.xlarge/g5.xlarge — omits --spot):\n` +
+        `       npm run aws:serve -- --run-id ${runId}\n` +
+        `  2. Or allow automatic Spot -> On-Demand fallback:\n` +
+        `       npm run aws:serve -- --run-id ${runId} --spot --fallback-on-demand\n` +
+        `  3. Or if G-family quota is 0 altogether, run a short 30m Spot serve on p4d.24xlarge:\n` +
+        `       npm run aws:serve -- --run-id ${runId} --instance p4d.24xlarge --spot --max-wall-minutes 30`
+    );
+  }
   process.exit(1);
 }
 
@@ -683,10 +816,10 @@ function printHelp() {
 Commands:
   cost       Estimate On-Demand & Spot cost (--instance, --hours)
   launch     Bundle local code & data to S3 and launch EC2 GPU training instance
-             (--instance, [--mode sweep|macro-batch|linesearch-suite|two-phase|pokemon-pirate|g6e],
+             (--instance, [--mode refined|two-phase|linesearch-suite|macro-batch|sweep|pokemon-pirate|g6e],
               [--config], [--bucket], [--regions ...], [--spot], [--max-wall-minutes], [--dry-run])
   serve      Launch single-GPU Gemma 4 inference server from an S3 checkpoint
-             (--run-id <train-run-id>, [--checkpoint lbfgs_adam_strong_wolfe_best],
+             (--run-id <train-run-id>, [--checkpoint qqn_two_stage_precond_best],
               [--instance g6e.xlarge], [--port 8000], [--spot], [--dry-run])
   status     List all EC2 instances tagged Project=qqn-llm across tracked regions
   tail       Print latest live train.log synced to S3 (--run-id, [--lines 60], [--user-data])

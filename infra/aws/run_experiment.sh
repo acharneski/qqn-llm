@@ -64,4 +64,12 @@ if command -v node >/dev/null 2>&1; then
   node scripts/report.mjs "${OUT_DIR}" 2>&1 | tee -a "${LOG_FILE}" || true
 fi
 
+if compgen -G "${OUT_DIR}/checkpoints/*_best" >/dev/null; then
+  for ckpt_dir in "${OUT_DIR}"/checkpoints/*_best; do
+    ckpt_name="$(basename "${ckpt_dir}")"
+    echo "[qqn-llm] Phase 2 checkpoint ready: ${ckpt_name}" | tee -a "${LOG_FILE}"
+    echo "[qqn-llm] Serve command: npm run aws:serve -- --run-id ${RUN_ID} --checkpoint ${ckpt_name} --spot" | tee -a "${LOG_FILE}"
+  done
+fi
+
 echo "[qqn-llm] Run ${RUN_ID} finished." | tee -a "${LOG_FILE}"

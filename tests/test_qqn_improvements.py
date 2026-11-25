@@ -344,3 +344,95 @@ def test_l2sp_runtime_anchor_tuple_has_zero_closed_over_jaxpr_consts():
     expected_reg = 0.5 * 0.1 * 1024.0 * (2.0 - 1.0) ** 2
     assert np.isclose(float(val - loss_no_anchor), expected_reg, rtol=1e-5)
     assert np.allclose(grad["w"][8:], 0.1 * (2.0 - 1.0), rtol=1e-5)
+
+
+def test_monotone_quadratic_and_refined_phase1_phase2_configs():
+    """Verify monotone_quadratic ray continuation for t > 1 and refined/Phase-2 YAML validity."""
+    from qqn_llm.config import load_config
+
+    mesh, sharding = _single_device_mesh_and_sharding()
+
+    def loss_fn(p, _b):
+        return 0.5 * jnp.sum((p["w"] - 1.6) ** 2)
+
+    p0 = {"w": jnp.zeros((4,), dtype=jnp.float32)}
+    cfg = OptimizerConfig(
+        name="mono_sw",
+        kind="qqn",
+        oracle="lbfgs_adam",
+        learning_rate=1.0,
+        path_strategy="monotone_quadratic",
+        tangent_mode="preconditioned",
+        line_search="strong_wolfe",
+        c1=1e-4,
+        c2=0.1,
+        ls_max_iter=4,
+        max_t=2.0,
+    )
+    runner = QQNRunner(loss_fn, cfg, mesh=mesh, param_sharding=sharding)
+    st = runner.init(p0, None)
+    p1, st1, metrics = runner.step(p0, st, None)
+    assert metrics["ls_success"] == 1.0
+    assert st1.value < st.value
+
+    # Validate Phase 1 refined benchmark and Phase 2 single-winner end-use configs
+    refined_cfg = load_config("configs/gemma4_e2b_aws_refined.yaml")
+    assert refined_cfg.training.save_best_checkpoint is False
+    assert refined_cfg.data.val_examples == 512
+    assert len(refined_cfg.optimizers) == 7
+
+    phase2_cfg = load_config("configs/gemma4_e2b_pokemon_pirate.yaml")
+    assert len(phase2_cfg.optimizers) == 1
+    assert phase2_cfg.optimizers[0].name == "qqn_two_stage_precond"
+    assert phase2_cfg.training.save_best_checkpoint is True
+
+
+def test_cross_topology_fsdp_to_single_device_orbax_restore(tmp_path):
+    """Save a 4-device FSDP-sharded Orbax checkpoint and restore it in a 1-device process."""
+    import os
+    import subprocess
+    import sys
+
+    ckpt_dir = tmp_path / "fsdp_ckpt"
+    env_save = dict(os.environ)
+    env_save["JAX_PLATFORMS"] = "cpu"
+    env_save["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    env_save["PYTHONPATH"] = "src:qqn-jax"
+
+    save_code = f"""
+import jax, jax.numpy as jnp, numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from qqn_llm.checkpoint import save_checkpoint
+assert len(jax.devices()) == 4
+mesh = Mesh(np.array(jax.devices()), ("fsdp",))
+sharded = NamedSharding(mesh, P("fsdp", None))
+replicated = NamedSharding(mesh, P())
+params = {{
+    "embed": jax.device_put(jnp.arange(64, dtype=jnp.float32).reshape(16, 4), sharded),
+    "layer_0": {{"mlp": {{"gating_einsum": {{"w": jax.device_put(jnp.ones((8, 4), dtype=jnp.float32) * 2.0, sharded)}}}}}},
+    "norm": jax.device_put(jnp.ones((4,), dtype=jnp.float32) * 3.0, replicated),
+}}
+save_checkpoint(params, {str(ckpt_dir)!r}, dtype="bfloat16", metadata={{"step": 10}})
+"""
+    subprocess.run([sys.executable, "-c", save_code], env=env_save, check=True)
+
+    env_restore = dict(os.environ)
+    env_restore["JAX_PLATFORMS"] = "cpu"
+    env_restore["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
+    env_restore["PYTHONPATH"] = "src:qqn-jax"
+
+    restore_code = f"""
+import jax, jax.numpy as jnp
+from qqn_llm.checkpoint import restore_checkpoint
+assert len(jax.devices()) == 1
+restored_untyped = restore_checkpoint({str(ckpt_dir)!r}, target_params=None)
+assert isinstance(restored_untyped["embed"], jax.Array)
+assert restored_untyped["embed"].dtype == jnp.bfloat16
+assert jnp.allclose(restored_untyped["embed"].astype(jnp.float32), jnp.arange(64, dtype=jnp.float32).reshape(16, 4))
+assert jnp.allclose(restored_untyped["layer_0"]["mlp"]["gating_einsum"]["w"].astype(jnp.float32), jnp.ones((8, 4), dtype=jnp.float32) * 2.0)
+assert jnp.allclose(restored_untyped["norm"].astype(jnp.float32), jnp.ones((4,), dtype=jnp.float32) * 3.0)
+"""
+    subprocess.run([sys.executable, "-c", restore_code], env=env_restore, check=True)
+
+
+
