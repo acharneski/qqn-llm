@@ -1088,7 +1088,15 @@ class QQNRunner:
                 fb_ok_g, fb_gnorm = self._finite_and_norm_jit(fb_g)
             evals += 1
             fb_v = float(fb_v_arr)
-            if math.isfinite(fb_v) and bool(fb_ok_g) and fb_v < state.value:
+            # Require a meaningful reduction beyond bf16 noise so near-zero noise-floor
+            # jitter (e.g. 0.0015 -> 0.0014) counts as a stall instead of resetting
+            # `consecutive_stalls` for 6+ wasted steps.
+            min_fb_drop = max(1e-6, 1e-3 * abs(state.value))
+            if (
+                math.isfinite(fb_v)
+                and bool(fb_ok_g)
+                and (state.value - fb_v) > min_fb_drop
+            ):
                 best_p, _ = self._fallback_candidate_jit(params, grad, g_ref, tau_arr)
                 best_v, best_g, best_t, best_gnorm = (
                     fb_v,

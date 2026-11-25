@@ -8,6 +8,9 @@ MAX_WALL_MINUTES="${MAX_WALL_MINUTES:-120}"
 
 export XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-cuda_async}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export XLA_CLIENT_MEM_FRACTION="${XLA_CLIENT_MEM_FRACTION:-0.95}"
+export XLA_PYTHON_CLIENT_ABORT_COLLECTIVES_ON_FAILURE="${XLA_PYTHON_CLIENT_ABORT_COLLECTIVES_ON_FAILURE:-1}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/jax_cache}"
 
 OUT_DIR="runs/${RUN_ID}"
@@ -50,11 +53,12 @@ if [ ! -d .venv ]; then
   .venv/bin/pip install -e ./qqn-jax -e ".[cuda]" >> "${LOG_FILE}" 2>&1
 fi
 
-echo "[qqn-llm] Starting run ${RUN_ID} with config ${CONFIG_PATH} (max ${MAX_WALL_MINUTES}m, allocator=${XLA_PYTHON_CLIENT_ALLOCATOR}, preallocate=${XLA_PYTHON_CLIENT_PREALLOCATE})" | tee -a "${LOG_FILE}"
-timeout "${MAX_WALL_MINUTES}m" \
+echo "[qqn-llm] Starting run ${RUN_ID} with config ${CONFIG_PATH} (max ${MAX_WALL_MINUTES}m, allocator=${XLA_PYTHON_CLIENT_ALLOCATOR}, mem_fraction=${XLA_CLIENT_MEM_FRACTION})" | tee -a "${LOG_FILE}"
+timeout --kill-after=30s "${MAX_WALL_MINUTES}m" \
   .venv/bin/python -m qqn_llm.train \
   --config "${CONFIG_PATH}" \
-  --output-dir "${OUT_DIR}" 2>&1 | tee -a "${LOG_FILE}"
+  --output-dir "${OUT_DIR}" 2>&1 | tee -a "${LOG_FILE}" || \
+  echo "[qqn-llm] Training command exited with status $?" | tee -a "${LOG_FILE}"
 
 if command -v node >/dev/null 2>&1; then
   node scripts/report.mjs "${OUT_DIR}" 2>&1 | tee -a "${LOG_FILE}" || true
