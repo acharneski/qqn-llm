@@ -21,6 +21,7 @@ const DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-2", "eu-west-1"];
 
 const MODE_CONFIGS = {
   refined: "configs/gemma4_e2b_aws_refined.yaml",
+  "owl-quant": "configs/gemma4_e2b_aws_owl_quant.yaml",
   "two-phase": "configs/gemma4_e2b_aws_two_phase.yaml",
   "linesearch-suite": "configs/gemma4_e2b_aws_linesearch_suite.yaml",
   "macro-batch": "configs/gemma4_e2b_aws_macro_batch.yaml",
@@ -663,7 +664,7 @@ function cmdServe(flags) {
 
   console.log(
     `Launching Gemma 4 inference server ${serveId} on [${candidateInstances.join(" -> ")}] ` +
-      `(${spotRequested ? (fallbackOnDemand ? "SPOT -> ON-DEMAND fallback" : "SPOT") : "ON-DEMAND"})`
+    `(${spotRequested ? (fallbackOnDemand ? "SPOT -> ON-DEMAND fallback" : "SPOT") : "ON-DEMAND"})`
   );
   console.log(`  Checkpoint:  ${checkpointUri}`);
   console.log(`  Port:        ${port} (auto-shutdown after ${maxWallMinutes}m)`);
@@ -799,12 +800,12 @@ function cmdServe(flags) {
   if (sawSpotQuotaError && !fallbackOnDemand) {
     console.error(
       `\nTip: Your AWS account hit 'MaxSpotInstanceCountExceeded' on G-family Spot instances.\n` +
-        `  1. Try On-Demand single-GPU (~$0.80-$1.01/hr on g6.xlarge/g5.xlarge — omits --spot):\n` +
-        `       npm run aws:serve -- --run-id ${runId}\n` +
-        `  2. Or allow automatic Spot -> On-Demand fallback:\n` +
-        `       npm run aws:serve -- --run-id ${runId} --spot --fallback-on-demand\n` +
-        `  3. Or if G-family quota is 0 altogether, run a short 30m Spot serve on p4d.24xlarge:\n` +
-        `       npm run aws:serve -- --run-id ${runId} --instance p4d.24xlarge --spot --max-wall-minutes 30`
+      `  1. Try On-Demand single-GPU (~$0.80-$1.01/hr on g6.xlarge/g5.xlarge — omits --spot):\n` +
+      `       npm run aws:serve -- --run-id ${runId}\n` +
+      `  2. Or allow automatic Spot -> On-Demand fallback:\n` +
+      `       npm run aws:serve -- --run-id ${runId} --spot --fallback-on-demand\n` +
+      `  3. Or if G-family quota is 0 altogether, run a short 30m Spot serve on p4d.24xlarge:\n` +
+      `       npm run aws:serve -- --run-id ${runId} --instance p4d.24xlarge --spot --max-wall-minutes 30`
     );
   }
   process.exit(1);

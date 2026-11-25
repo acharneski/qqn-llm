@@ -4,7 +4,8 @@
  *
  * Reads JSON result files produced by `qqn_llm.train` in a run directory,
  * prints a Markdown comparison table to stdout, and writes `summary.md` and
- * `summary.csv` into that directory.
+ * `summary.csv` (plus quantization leaderboard when quantization telemetry is
+ * present) into that directory.
  *
  * Usage:
  *   node scripts/report.mjs runs/smoke_local
@@ -88,12 +89,39 @@ const rows = files.map((file) => {
     avgStepSize,
     acceptRate,
     paramsCount: data.num_params ?? 0,
+    // Optional OWL / Quantization telemetry
+    quantQType: data.quant_eval_qtype ?? null,
+    quantBits: data.quant_eval_bits ?? null,
+    baseTrainLoss: data.quant_baseline_train_loss ?? NaN,
+    pureTrainLoss: data.final_pure_train_loss ?? lastVal?.pure_train_loss ?? NaN,
+    quantTrainLoss: data.final_quant_train_loss ?? lastVal?.quant_train_loss ?? NaN,
+    quantValLoss: data.final_quant_val_loss ?? lastVal?.quant_val_loss ?? NaN,
+    quantValPpl: data.final_quant_val_ppl ?? lastVal?.quant_val_ppl ?? NaN,
+    paramL1Norm: data.final_param_l1_norm ?? lastVal?.param_l1_norm ?? NaN,
+    paramL1Delta: data.final_param_l1_delta ?? lastVal?.param_l1_delta ?? NaN,
+    boundaryFrac: data.final_quant_boundary_frac ?? lastVal?.quant_boundary_frac ?? NaN,
+    quantL1Err: data.final_quant_l1_error ?? lastVal?.quant_l1_error ?? NaN,
+    noWorseViol: data.final_no_worse_violation ?? lastVal?.no_worse_violation ?? NaN,
   };
 });
 
-rows.sort((a, b) => (a.bestValLoss ?? Infinity) - (b.bestValLoss ?? Infinity));
+const hasQuant = rows.some((r) => r.quantQType !== null);
+
+if (hasQuant) {
+  // Sort quantization experiments primarily by quantized validation loss, then L1 norm
+  rows.sort((a, b) => {
+    const qa = Number.isFinite(a.quantValLoss) ? a.quantValLoss : Infinity;
+    const qb = Number.isFinite(b.quantValLoss) ? b.quantValLoss : Infinity;
+    if (Math.abs(qa - qb) > 1e-6) return qa - qb;
+    return (a.paramL1Norm ?? Infinity) - (b.paramL1Norm ?? Infinity);
+  });
+} else {
+  rows.sort((a, b) => (a.bestValLoss ?? Infinity) - (b.bestValLoss ?? Infinity));
+}
 
 const fmt = (v, d = 4) => (Number.isFinite(v) ? v.toFixed(d) : "—");
+const fmtSigned = (v, d = 2) =>
+  Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(d)}` : "—";
 const fmtCompact = (v) => {
   if (!Number.isFinite(v)) return "—";
   if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
@@ -104,7 +132,7 @@ const fmtCompact = (v) => {
 const mdLines = [
   `# Experiment Summary: \`${path.basename(targetDir)}\``,
   "",
-  `Parameters: **${(rows[0]?.paramsCount || 0).toLocaleString()}** | Optimizers compared: **${rows.length}** (sorted by Best Val Loss)`,
+  `Parameters: **${(rows[0]?.paramsCount || 0).toLocaleString()}** | Optimizers compared: **${rows.length}** (${hasQuant ? "sorted by Quantized Val Loss" : "sorted by Best Val Loss"})`,
   "",
   "| Optimizer | Steps | Evals | Best @ (Step/Eval) | Init Train | Final Train | Best Val | Best PPL | Best ΔL1 | Best ΔL2 | Final ΔL1 | Final ΔL2 | Steady (s) | s/eval | Mean `t` | Accept % |",
   "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
@@ -114,6 +142,26 @@ const mdLines = [
   ),
   "",
 ];
+
+if (hasQuant) {
+  mdLines.push(
+    "## OWL Half-Quantization & No-Worse Constraint Telemetry",
+    "",
+    "| Optimizer | Target Grid | Ref Train | Pure Train | No-Worse Viol | Quant Train | Quant Val (PPL) | `‖θ‖₁` | `Δ‖θ‖₁` | Exact Boundary % | Quant L1 Err |",
+    "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ...rows.map((r) => {
+      const gridLabel =
+        r.quantQType === "uniform"
+          ? `uniform-${r.quantBits}b`
+          : r.quantQType || "—";
+      const bndPct = Number.isFinite(r.boundaryFrac)
+        ? `${(r.boundaryFrac * 100).toFixed(2)}%`
+        : "—";
+      return `| \`${r.name}\` | \`${gridLabel}\` | ${fmt(r.baseTrainLoss)} | ${fmt(r.pureTrainLoss)} | ${fmt(r.noWorseViol, 5)} | ${fmt(r.quantTrainLoss)} | **${fmt(r.quantValLoss)}** (${fmt(r.quantValPpl, 2)}) | ${fmt(r.paramL1Norm, 2)} | **${fmtSigned(r.paramL1Delta, 2)}** | **${bndPct}** | ${fmt(r.quantL1Err, 4)} |`;
+    }),
+    ""
+  );
+}
 
 const md = mdLines.join("\n");
 fs.writeFileSync(path.join(targetDir, "summary.md"), md, "utf-8");
@@ -139,6 +187,21 @@ const csvHeader = [
   "wall_seconds",
   "mean_step_size",
   "accept_rate",
+  ...(hasQuant
+    ? [
+        "quant_qtype",
+        "ref_train_loss",
+        "pure_train_loss",
+        "no_worse_violation",
+        "quant_train_loss",
+        "quant_val_loss",
+        "quant_val_ppl",
+        "param_l1_norm",
+        "param_l1_delta",
+        "quant_boundary_frac",
+        "quant_l1_error",
+      ]
+    : []),
 ].join(",");
 const csvRows = rows.map((r) =>
   [
@@ -162,8 +225,27 @@ const csvRows = rows.map((r) =>
     r.wallSec,
     r.avgStepSize,
     r.acceptRate,
+    ...(hasQuant
+      ? [
+          r.quantQType,
+          r.baseTrainLoss,
+          r.pureTrainLoss,
+          r.noWorseViol,
+          r.quantTrainLoss,
+          r.quantValLoss,
+          r.quantValPpl,
+          r.paramL1Norm,
+          r.paramL1Delta,
+          r.boundaryFrac,
+          r.quantL1Err,
+        ]
+      : []),
   ].join(",")
 );
-fs.writeFileSync(path.join(targetDir, "summary.csv"), [csvHeader, ...csvRows].join("\n") + "\n", "utf-8");
+fs.writeFileSync(
+  path.join(targetDir, "summary.csv"),
+  [csvHeader, ...csvRows].join("\n") + "\n",
+  "utf-8"
+);
 
 console.log(md);

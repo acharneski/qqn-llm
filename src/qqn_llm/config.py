@@ -8,6 +8,11 @@ from typing import Any, Literal, Optional
 
 import yaml
 
+OptimizerKind = Literal["qqn", "adamw", "lbfgs_optax", "owl_quant", "ptq"]
+QuantQType = Literal["bfloat16", "float16", "uniform"]
+QuantRegionMode = Literal["half_quant", "midpoint_cell", "orthant", "none"]
+QuantBoundaryMode = Literal["sticky", "owl", "owl_snap"]
+
 
 @dataclass
 class ModelConfig:
@@ -50,9 +55,16 @@ class TrainingConfig:
     save_final_checkpoint: bool = False
     checkpoint_dtype: Literal["bfloat16", "float32"] = "bfloat16"
     l2_reg: float = 0.0
+    l1_reg: float = 0.0
     fsdp_axis_size: int = 1
     stop_on_train_loss: float = 0.0
     stop_on_consecutive_stalls: int = 0
+    # Optional quantization evaluation telemetry across all optimizers in the sweep
+    quant_eval_qtype: Optional[QuantQType] = None
+    quant_eval_bits: int = 16
+    quant_eval_step: Optional[float] = None
+    quant_eval_lo: float = -1.0
+    quant_eval_hi: float = 1.0
 
 
 @dataclass
@@ -63,7 +75,7 @@ class PhaseConfig:
     steps: int = 15
     macro_batch_examples: int = 128
     inner_steps_per_batch: int = 1
-    kind: Literal["qqn", "adamw", "lbfgs_optax"] = "adamw"
+    kind: OptimizerKind = "adamw"
     oracle: str = "lbfgs_adam"
     history_size: int = 5
     line_search: str = "backtracking"
@@ -82,16 +94,30 @@ class PhaseConfig:
     beta2: float = 0.999
     max_qn_gain: float = 0.0
     anchor_weight_decay: float = 0.0
+    l1_weight_decay: float = 0.0
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
     grad_clip_norm: float = 0.0
+    # OWL-like half-quantization & PTQ options
+    quant_qtype: QuantQType = "bfloat16"
+    quant_bits: int = 16
+    quant_step: Optional[float] = None
+    quant_lo: float = -1.0
+    quant_hi: float = 1.0
+    quant_region_mode: QuantRegionMode = "half_quant"
+    quant_boundary_mode: QuantBoundaryMode = "sticky"
+    no_worse_tol: float = 0.0
+    enforce_no_worse: bool = True
+    cell_scaled_metric: bool = True
+    final_snap: bool = False
+    ptq_mode: Literal["rtn", "rtz"] = "rtn"
 
 
 @dataclass
 class OptimizerConfig:
     name: str = "qqn_lbfgs_m5"
-    kind: Literal["qqn", "adamw", "lbfgs_optax"] = "qqn"
+    kind: OptimizerKind = "qqn"
     # QQN options
     oracle: str = "lbfgs"
     history_size: int = 5
@@ -110,11 +136,25 @@ class OptimizerConfig:
     beta2: float = 0.999
     max_qn_gain: float = 0.0
     anchor_weight_decay: float = 0.0
+    l1_weight_decay: float = 0.0
     # AdamW / AdamOracle options
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
     grad_clip_norm: float = 0.0
+    # OWL-like half-quantization & PTQ options
+    quant_qtype: QuantQType = "bfloat16"
+    quant_bits: int = 16
+    quant_step: Optional[float] = None
+    quant_lo: float = -1.0
+    quant_hi: float = 1.0
+    quant_region_mode: QuantRegionMode = "half_quant"
+    quant_boundary_mode: QuantBoundaryMode = "sticky"
+    no_worse_tol: float = 0.0
+    enforce_no_worse: bool = True
+    cell_scaled_metric: bool = True
+    final_snap: bool = False
+    ptq_mode: Literal["rtn", "rtz"] = "rtn"
     # Optional multi-phase schedule (overrides single-phase optimizer settings when non-empty)
     phases: list[PhaseConfig] = field(default_factory=list)
 

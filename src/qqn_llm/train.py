@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import math
 import time
@@ -26,7 +27,15 @@ from qqn_llm.model import (
     make_batch_sharding,
     make_fsdp_sharding,
 )
-from qqn_llm.optimizers import AdamWRunner, OptaxLBFGSRunner, QQNRunner
+from qqn_llm.optimizers import (
+    AdamWRunner,
+    OWLQuantRunner,
+    OptaxLBFGSRunner,
+    PTQRunner,
+    QQNRunner,
+    make_device_quant_telemetry_fn,
+    make_round_params_jit,
+)
 
 
 def _phase_to_opt_cfg(name: str, phase: PhaseConfig) -> OptimizerConfig:
@@ -50,10 +59,23 @@ def _phase_to_opt_cfg(name: str, phase: PhaseConfig) -> OptimizerConfig:
         beta2=phase.beta2,
         max_qn_gain=phase.max_qn_gain,
         anchor_weight_decay=phase.anchor_weight_decay,
+        l1_weight_decay=phase.l1_weight_decay,
         learning_rate=phase.learning_rate,
         warmup_ratio=phase.warmup_ratio,
         weight_decay=phase.weight_decay,
         grad_clip_norm=phase.grad_clip_norm,
+        quant_qtype=phase.quant_qtype,
+        quant_bits=phase.quant_bits,
+        quant_step=phase.quant_step,
+        quant_lo=phase.quant_lo,
+        quant_hi=phase.quant_hi,
+        quant_region_mode=phase.quant_region_mode,
+        quant_boundary_mode=phase.quant_boundary_mode,
+        no_worse_tol=phase.no_worse_tol,
+        enforce_no_worse=phase.enforce_no_worse,
+        cell_scaled_metric=phase.cell_scaled_metric,
+        final_snap=phase.final_snap,
+        ptq_mode=phase.ptq_mode,
     )
 
 
@@ -85,10 +107,23 @@ def _resolve_phases(exp_cfg: ExperimentConfig, opt_cfg: OptimizerConfig) -> list
             beta2=opt_cfg.beta2,
             max_qn_gain=opt_cfg.max_qn_gain,
             anchor_weight_decay=opt_cfg.anchor_weight_decay,
+            l1_weight_decay=opt_cfg.l1_weight_decay,
             learning_rate=opt_cfg.learning_rate,
             warmup_ratio=opt_cfg.warmup_ratio,
             weight_decay=opt_cfg.weight_decay,
             grad_clip_norm=opt_cfg.grad_clip_norm,
+            quant_qtype=opt_cfg.quant_qtype,
+            quant_bits=opt_cfg.quant_bits,
+            quant_step=opt_cfg.quant_step,
+            quant_lo=opt_cfg.quant_lo,
+            quant_hi=opt_cfg.quant_hi,
+            quant_region_mode=opt_cfg.quant_region_mode,
+            quant_boundary_mode=opt_cfg.quant_boundary_mode,
+            no_worse_tol=opt_cfg.no_worse_tol,
+            enforce_no_worse=opt_cfg.enforce_no_worse,
+            cell_scaled_metric=opt_cfg.cell_scaled_metric,
+            final_snap=opt_cfg.final_snap,
+            ptq_mode=opt_cfg.ptq_mode,
         )
     ]
 
@@ -101,6 +136,22 @@ def _make_runner(loss_fn, opt_cfg: OptimizerConfig, total_steps: int, bundle: Mo
             mesh=bundle.mesh,
             param_sharding=bundle.param_sharding,
             total_steps=total_steps,
+        )
+    if opt_cfg.kind == "owl_quant":
+        return OWLQuantRunner(
+            loss_fn,
+            opt_cfg,
+            mesh=bundle.mesh,
+            param_sharding=bundle.param_sharding,
+            num_params=bundle.num_params,
+            total_steps=total_steps,
+        )
+    if opt_cfg.kind == "ptq":
+        return PTQRunner(
+            loss_fn,
+            opt_cfg,
+            mesh=bundle.mesh,
+            param_sharding=bundle.param_sharding,
         )
     if opt_cfg.kind == "adamw":
         return AdamWRunner(loss_fn, opt_cfg, total_steps=total_steps)
@@ -194,6 +245,28 @@ def _make_device_weight_deviation_fn(sharded_anchor_params, mesh, num_params: in
     return compute
 
 
+def _resolve_quant_eval_spec(exp_cfg: ExperimentConfig, phases: list[PhaseConfig]):
+    """Determine quantization telemetry spec if configured globally or by a phase."""
+    if exp_cfg.training.quant_eval_qtype is not None:
+        return (
+            exp_cfg.training.quant_eval_qtype,
+            exp_cfg.training.quant_eval_bits,
+            exp_cfg.training.quant_eval_step,
+            exp_cfg.training.quant_eval_lo,
+            exp_cfg.training.quant_eval_hi,
+        )
+    for ph in reversed(phases):
+        if ph.kind in ("owl_quant", "ptq"):
+            return (
+                ph.quant_qtype,
+                ph.quant_bits,
+                ph.quant_step,
+                ph.quant_lo,
+                ph.quant_hi,
+            )
+    return None
+
+
 def run_single_optimizer(
     exp_cfg: ExperimentConfig,
     opt_cfg: OptimizerConfig,
@@ -207,6 +280,29 @@ def run_single_optimizer(
     """Run one optimizer configuration (single- or multi-phase) and write JSON telemetry."""
     phases = _resolve_phases(exp_cfg, opt_cfg)
     total_planned_steps = sum(p.steps for p in phases)
+    quant_spec = _resolve_quant_eval_spec(exp_cfg, phases)
+
+    quant_telemetry_fn = None
+    round_params_jit = None
+    if quant_spec is not None:
+        qtype, qbits, qstep, qlo, qhi = quant_spec
+        quant_telemetry_fn = make_device_quant_telemetry_fn(
+            bundle.mesh,
+            bundle.num_params,
+            qtype=qtype,
+            bits=qbits,
+            step=qstep,
+            lo=qlo,
+            hi=qhi,
+        )
+        round_params_jit = make_round_params_jit(
+            bundle.param_sharding,
+            qtype=qtype,
+            bits=qbits,
+            step=qstep,
+            lo=qlo,
+            hi=qhi,
+        )
 
     print(f"[{opt_cfg.name}] Placing initial parameters onto FSDP mesh...", flush=True)
     params = jax.device_put(
@@ -215,6 +311,13 @@ def run_single_optimizer(
     )
 
     init_val = float(eval_loss_jit(params, sharded_val_batch))
+    init_quant_stats: dict[str, float] | None = None
+    if quant_telemetry_fn is not None:
+        init_quant_stats = quant_telemetry_fn(params)
+    quant_baseline_stats: dict[str, float] | None = init_quant_stats
+    quant_baseline_train_loss: float | None = None
+    quant_baseline_val_loss: float | None = init_val
+
     init_train_loss: float | None = None
     compile_and_init_sec = 0.0
     history: list[dict[str, Any]] = []
@@ -231,6 +334,7 @@ def run_single_optimizer(
         "weight_l1_mean": 0.0,
         "weight_l2_rms": 0.0,
     }
+    final_quant: dict[str, float] = {}
     global_step = 0
     cum_evals = 0
     cum_tokens = 0
@@ -238,20 +342,28 @@ def run_single_optimizer(
 
     for phase_idx, phase in enumerate(phases):
         phase_opt_cfg = _phase_to_opt_cfg(opt_cfg.name, phase)
-        # Only materialize a GPU copy of initial weights when L2-SP anchor regularization
-        # is explicitly requested for this phase (keeps 1.14 GiB/GPU free otherwise).
-        # Pass `sharded_anchor_params` as an explicit traced tuple input `(batch, anchor)`
-        # rather than closing over it inside `loss_fn` so MLIR never embeds 9.3 GB of
-        # weights as an inlined compile-time constant!
+        # If entering a quantization phase after a float32 warmup phase, anchor the
+        # quantization baseline L1 & loss right at the entry to the quantization stage!
+        if (
+            phase_idx > 0
+            and phase.kind in ("owl_quant", "ptq")
+            and quant_telemetry_fn is not None
+        ):
+            quant_baseline_stats = quant_telemetry_fn(params)
+            quant_baseline_val_loss = float(eval_loss_jit(params, sharded_val_batch))
+
         sharded_anchor_params = None
-        if phase.anchor_weight_decay > 0.0:
-            sharded_anchor_params = jax.device_put(
-                jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), bundle.params),
-                bundle.param_sharding,
-            )
+        eff_l1_reg = float(exp_cfg.training.l1_reg) + float(phase.l1_weight_decay)
+        if phase.anchor_weight_decay > 0.0 or eff_l1_reg > float(exp_cfg.training.l1_reg):
+            if phase.anchor_weight_decay > 0.0:
+                sharded_anchor_params = jax.device_put(
+                    jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), bundle.params),
+                    bundle.param_sharding,
+                )
             phase_loss_fn = make_accumulated_loss_fn(
                 bundle.forward_fn,
                 l2_reg=exp_cfg.training.l2_reg,
+                l1_reg=eff_l1_reg,
                 mesh=bundle.mesh,
                 anchor_params=None,
                 anchor_l2_reg=phase.anchor_weight_decay,
@@ -270,6 +382,10 @@ def run_single_optimizer(
             phase_loss_fn, phase_opt_cfg, total_steps=phase.steps, bundle=bundle
         )
         host_stepped = bool(getattr(runner, "is_host_stepped", False))
+        supports_last_flag = (
+            host_stepped
+            and "is_last_phase_step" in inspect.signature(runner.step).parameters
+        )
 
         if exp_cfg.data.batch_mode == "fixed_subset" and not opt_cfg.phases:
             raw_first_batch = _shard_batch(data.fixed_train_batch, bundle)
@@ -315,9 +431,14 @@ def run_single_optimizer(
             if (warm_to_use is not None and warm_to_use[0] is not None)
             else ""
         )
+        oracle_label = (
+            phase.oracle
+            if phase.kind in ("qqn", "owl_quant")
+            else (phase.ptq_mode if phase.kind == "ptq" else "-")
+        )
         print(
             f"[{phase_tag}] Compiling & running init (kind={phase.kind}, "
-            f"oracle={phase.oracle if phase.kind == 'qqn' else '-'}, "
+            f"oracle={oracle_label}, "
             f"batch shape={raw_first_batch['input_ids'].shape}, inner={phase.inner_steps_per_batch}{warm_note})...",
             flush=True,
         )
@@ -335,6 +456,8 @@ def run_single_optimizer(
         compile_and_init_sec += phase_init_sec
         if init_train_loss is None:
             init_train_loss = float(state.value)
+        if quant_baseline_train_loss is None or phase.kind in ("owl_quant", "ptq"):
+            quant_baseline_train_loss = float(eval_loss_jit(params, raw_first_batch))
         print(
             f"[{phase_tag}] init finished in {phase_init_sec:.1f}s "
             f"(train_loss={float(state.value):.4f}, val_loss={init_val if phase_idx == 0 else best_val_loss:.4f}); starting {phase.steps} steps...",
@@ -342,6 +465,7 @@ def run_single_optimizer(
         )
 
         tokens_per_batch = int(jnp.sum(raw_first_batch["loss_mask"]))
+        current_raw_batch = raw_first_batch
         current_batch = first_batch
         del raw_first_batch, first_batch
         prev_phase_evals = int(state.num_evals)
@@ -360,6 +484,7 @@ def run_single_optimizer(
             ):
                 raw_next_batch = _shard_batch(next(batch_iter), bundle)
                 tokens_per_batch = int(jnp.sum(raw_next_batch["loss_mask"]))
+                current_raw_batch = raw_next_batch
                 current_batch = _wrap_phase_batch(raw_next_batch)
                 del raw_next_batch
                 state = refresh_fn(params, state, current_batch)
@@ -371,12 +496,22 @@ def run_single_optimizer(
                 and local_step < phase.steps
                 and (local_step % inner_k == 0)
             )
+            is_last_phase_step = local_step == phase.steps
 
             t0 = time.perf_counter()
             if host_stepped:
-                params, state, metrics = step_fn(
-                    params, state, current_batch, will_refresh_next=will_refresh_next
-                )
+                if supports_last_flag:
+                    params, state, metrics = step_fn(
+                        params,
+                        state,
+                        current_batch,
+                        will_refresh_next=will_refresh_next,
+                        is_last_phase_step=is_last_phase_step,
+                    )
+                else:
+                    params, state, metrics = step_fn(
+                        params, state, current_batch, will_refresh_next=will_refresh_next
+                    )
             else:
                 params, state, metrics = step_fn(params, state, current_batch)
                 jax.block_until_ready(metrics["loss"])
@@ -406,6 +541,9 @@ def run_single_optimizer(
                 "step_seconds": dt,
                 "cum_seconds": total_train_sec,
             }
+            for extra_key in ("l1_reduction", "kkt_lambda", "loss_cap"):
+                if extra_key in metrics:
+                    rec[extra_key] = float(metrics[extra_key])
 
             if rec["ls_success"] < 0.5:
                 consecutive_stalls += 1
@@ -416,6 +554,7 @@ def run_single_optimizer(
             if (
                 exp_cfg.data.batch_mode == "fixed_subset"
                 and not opt_cfg.phases
+                and phase.kind not in ("owl_quant", "ptq")
                 and exp_cfg.training.stop_on_train_loss > 0.0
                 and rec["train_loss"] <= exp_cfg.training.stop_on_train_loss
             ):
@@ -440,6 +579,34 @@ def run_single_optimizer(
                 rec["val_loss"] = val_loss
                 rec["val_ppl"] = float(math.exp(min(val_loss, 20.0)))
                 rec.update(dev)
+
+                if quant_telemetry_fn is not None and round_params_jit is not None:
+                    qstats = quant_telemetry_fn(params)
+                    q_params = round_params_jit(params)
+                    q_train_loss = float(eval_loss_jit(q_params, current_raw_batch))
+                    q_val_loss = float(eval_loss_jit(q_params, sharded_val_batch))
+                    del q_params
+                    base_l1 = (
+                        quant_baseline_stats["param_l1_norm"]
+                        if quant_baseline_stats is not None
+                        else qstats["param_l1_norm"]
+                    )
+                    ref_cap = rec.get(
+                        "loss_cap",
+                        quant_baseline_train_loss
+                        if quant_baseline_train_loss is not None
+                        else rec["train_loss"],
+                    )
+                    pure_train_ce = float(eval_loss_jit(params, current_raw_batch))
+                    qstats["pure_train_loss"] = pure_train_ce
+                    qstats["param_l1_delta"] = qstats["param_l1_norm"] - base_l1
+                    qstats["quant_train_loss"] = q_train_loss
+                    qstats["quant_val_loss"] = q_val_loss
+                    qstats["quant_val_ppl"] = float(math.exp(min(q_val_loss, 20.0)))
+                    qstats["no_worse_violation"] = max(0.0, pure_train_ce - ref_cap)
+                    rec.update(qstats)
+                    final_quant = qstats
+
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_val_step = global_step
@@ -478,9 +645,15 @@ def run_single_optimizer(
                 if "val_loss" in rec
                 else ""
             )
+            quant_str = (
+                f" | ‖θ‖₁={rec['param_l1_norm']:.1f} (Δ={rec['param_l1_delta']:+.2f}) "
+                f"| bnd={rec['quant_boundary_frac']*100:.1f}% | q_val={rec['quant_val_loss']:.4f}"
+                if "quant_boundary_frac" in rec
+                else ""
+            )
             print(
                 f"[{phase_tag}] step {global_step:3d}/{total_planned_steps} "
-                f"| loss={rec['train_loss']:.4f}{val_str} "
+                f"| loss={rec['train_loss']:.4f}{val_str}{quant_str} "
                 f"| evals={rec['num_evals']:3d} | t={rec['step_size']:.3g} "
                 f"| {dt:.2f}s",
                 flush=True,
@@ -510,7 +683,7 @@ def run_single_optimizer(
             and hasattr(runner, "export_preconditioner")
         ):
             carry_precond = runner.export_preconditioner(state)
-        del state, runner, sharded_anchor_params
+        del state, runner, sharded_anchor_params, current_raw_batch, current_batch
         gc.collect()
 
     del carry_precond
@@ -539,10 +712,10 @@ def run_single_optimizer(
             },
         )
 
-    result = {
+    result: dict[str, Any] = {
         "experiment_name": exp_cfg.experiment_name,
         "optimizer_name": opt_cfg.name,
-        "optimizer_kind": opt_cfg.kind if not opt_cfg.phases else "two_phase",
+        "optimizer_kind": opt_cfg.kind if not opt_cfg.phases else f"multi_phase:{phases[-1].kind}",
         "model_variant": exp_cfg.model.variant,
         "master_dtype": exp_cfg.model.master_dtype,
         "compute_dtype": exp_cfg.model.dtype,
@@ -564,6 +737,31 @@ def run_single_optimizer(
         "steady_train_seconds": steady_train_sec,
         "history": history,
     }
+    if quant_spec is not None and final_quant:
+        result["quant_eval_qtype"] = quant_spec[0]
+        result["quant_eval_bits"] = quant_spec[1]
+        result["quant_baseline_train_loss"] = quant_baseline_train_loss
+        result["quant_baseline_val_loss"] = quant_baseline_val_loss
+        result["quant_baseline_param_l1_norm"] = (
+            quant_baseline_stats["param_l1_norm"]
+            if quant_baseline_stats is not None
+            else None
+        )
+        result["quant_baseline_boundary_frac"] = (
+            quant_baseline_stats["quant_boundary_frac"]
+            if quant_baseline_stats is not None
+            else None
+        )
+        result["final_param_l1_norm"] = final_quant["param_l1_norm"]
+        result["final_param_l1_delta"] = final_quant["param_l1_delta"]
+        result["final_quant_boundary_frac"] = final_quant["quant_boundary_frac"]
+        result["final_quant_l1_error"] = final_quant["quant_l1_error"]
+        result["final_quant_max_error"] = final_quant["quant_max_error"]
+        result["final_pure_train_loss"] = final_quant["pure_train_loss"]
+        result["final_quant_train_loss"] = final_quant["quant_train_loss"]
+        result["final_quant_val_loss"] = final_quant["quant_val_loss"]
+        result["final_quant_val_ppl"] = final_quant["quant_val_ppl"]
+        result["final_no_worse_violation"] = final_quant["no_worse_violation"]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / f"{opt_cfg.name}.json"
@@ -595,12 +793,17 @@ def run_experiment(
     data = load_dataset_bundle(exp_cfg.data, bundle.vocab_size, exp_cfg.seed)
 
     base_train_loss_fn = make_accumulated_loss_fn(
-        bundle.forward_fn, l2_reg=exp_cfg.training.l2_reg, mesh=bundle.mesh
+        bundle.forward_fn,
+        l2_reg=exp_cfg.training.l2_reg,
+        l1_reg=exp_cfg.training.l1_reg,
+        mesh=bundle.mesh,
     )
     eval_loss_fn = (
         base_train_loss_fn
-        if exp_cfg.training.l2_reg == 0.0
-        else make_accumulated_loss_fn(bundle.forward_fn, l2_reg=0.0, mesh=bundle.mesh)
+        if (exp_cfg.training.l2_reg == 0.0 and exp_cfg.training.l1_reg == 0.0)
+        else make_accumulated_loss_fn(
+            bundle.forward_fn, l2_reg=0.0, l1_reg=0.0, mesh=bundle.mesh
+        )
     )
     eval_loss_jit = jax.jit(eval_loss_fn)
     sharded_val_batch = _shard_batch(data.val_batch, bundle)
@@ -632,7 +835,7 @@ def run_experiment(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run Gemma 4 + qqn-jax fine-tuning experiment"
+        description="Run Gemma 4 + qqn-jax fine-tuning / OWL quantization experiment"
     )
     parser.add_argument(
         "--config", type=str, required=True, help="Path to YAML experiment config"

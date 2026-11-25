@@ -33,6 +33,7 @@ def sequence_cross_entropy(
 def make_accumulated_loss_fn(
     forward_fn: Callable[[dict, jnp.ndarray], jnp.ndarray],
     l2_reg: float = 0.0,
+    l1_reg: float = 0.0,
     mesh: Optional[Mesh] = None,
     anchor_params: Optional[dict] = None,
     anchor_l2_reg: float = 0.0,
@@ -86,6 +87,11 @@ def make_accumulated_loss_fn(
             leaves = jax.tree_util.tree_leaves(params)
             l2 = sum(jnp.sum(x.astype(jnp.float32) ** 2) for x in leaves)
             mean_loss = mean_loss + jnp.asarray(l2_reg, jnp.float32) * l2
+
+        if l1_reg > 0.0:
+            leaves = jax.tree_util.tree_leaves(params)
+            l1 = sum(jnp.sum(jnp.abs(x.astype(jnp.float32))) for x in leaves)
+            mean_loss = mean_loss + jnp.asarray(l1_reg, jnp.float32) * l1
 
         if anchor_l2_reg > 0.0 and runtime_anchor is not None:
             sq_diff = sum(

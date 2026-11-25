@@ -1,0 +1,198 @@
+# OWL-Like Half-Quantization Stress Test (Local GPU — 32-bit float32 -> Coarse Uniform Lattice)
+#
+# Stress-tests the OWL-like quantization regime at coarser grid spacing (`bits: 6` symmetric
+# uniform grid over `[-0.25, +0.25]`, `Δ ≈ 0.0081`), where unconstrained L1 truncation (`PTQ-RTZ`)
+# catastrophically degrades LLM cross-entropy while `OWL-HalfQuant` preserves `L_train ≤ L_ref`,
+# reduces `‖θ‖₁`, and lands 100% of weights on exact grid boundaries.
+
+experiment_name: owl_quant_stress_local
+output_dir: runs/owl_quant_stress_local
+seed: 42
+
+model:
+  variant: tiny_smoke
+  dtype: float32
+  master_dtype: float32
+  remat: false
+  tiny_num_layers: 3
+  tiny_embed_dim: 256
+  tiny_hidden_dim: 512
+  tiny_num_heads: 4
+  tiny_num_kv_heads: 2
+  tiny_head_dim: 64
+  tiny_vocab_size: 2048
+
+data:
+  source: synthetic
+  seq_len: 128
+  train_examples: 64
+  val_examples: 64
+  micro_batch_size: 16
+  batch_mode: macro_batch
+  macro_batch_examples: 64
+  inner_steps_per_batch: 20
+
+training:
+  steps: 35
+  eval_every: 5
+  checkpoint_every: 0
+  l2_reg: 0.0
+  fsdp_axis_size: 1
+  quant_eval_qtype: uniform
+  quant_eval_bits: 6
+  quant_eval_lo: -1.2
+  quant_eval_hi: 1.2
+
+optimizers:
+  - name: ptq_rtn_6bit
+    kind: ptq
+    phases:
+      - name: stage1_fp32_base
+        kind: adamw
+        steps: 15
+        macro_batch_examples: 32
+        inner_steps_per_batch: 1
+        learning_rate: 1.5e-3
+        warmup_ratio: 0.15
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_ptq_rtn
+        kind: ptq
+        ptq_mode: rtn
+        quant_qtype: uniform
+        quant_bits: 6
+        quant_lo: -1.2
+        quant_hi: 1.2
+        steps: 1
+        macro_batch_examples: 64
+        inner_steps_per_batch: 1
+
+  - name: ptq_rtz_6bit
+    kind: ptq
+    phases:
+      - name: stage1_fp32_base
+        kind: adamw
+        steps: 15
+        macro_batch_examples: 32
+        inner_steps_per_batch: 1
+        learning_rate: 1.5e-3
+        warmup_ratio: 0.15
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_ptq_rtz
+        kind: ptq
+        ptq_mode: rtz
+        quant_qtype: uniform
+        quant_bits: 6
+        quant_lo: -1.2
+        quant_hi: 1.2
+        steps: 1
+        macro_batch_examples: 64
+        inner_steps_per_batch: 1
+
+  - name: qqn_midpoint_cell_6bit
+    kind: owl_quant
+    phases:
+      - name: stage1_fp32_base
+        kind: adamw
+        steps: 15
+        macro_batch_examples: 32
+        inner_steps_per_batch: 1
+        learning_rate: 1.5e-3
+        warmup_ratio: 0.15
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_midpoint
+        kind: owl_quant
+        oracle: lbfgs_adam
+        history_size: 5
+        path_strategy: quadratic
+        ls_max_iter: 5
+        max_t: 1.0
+        learning_rate: 0.75
+        max_qn_gain: 4.0
+        warm_start_preconditioner: true
+        quant_qtype: uniform
+        quant_bits: 6
+        quant_lo: -1.2
+        quant_hi: 1.2
+        quant_region_mode: midpoint_cell
+        no_worse_tol: 0.0
+        enforce_no_worse: true
+        cell_scaled_metric: true
+        final_snap: false
+        steps: 20
+        macro_batch_examples: 64
+        inner_steps_per_batch: 20
+
+  - name: qqn_owl_halfquant_6bit_snap
+    kind: owl_quant
+    phases:
+      - name: stage1_fp32_base
+        kind: adamw
+        steps: 15
+        macro_batch_examples: 32
+        inner_steps_per_batch: 1
+        learning_rate: 1.5e-3
+        warmup_ratio: 0.15
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_owl_snap
+        kind: owl_quant
+        oracle: lbfgs_adam
+        history_size: 5
+        path_strategy: quadratic
+        ls_max_iter: 5
+        max_t: 1.0
+        learning_rate: 0.75
+        max_qn_gain: 4.0
+        warm_start_preconditioner: true
+        quant_qtype: uniform
+        quant_bits: 6
+        quant_lo: -1.2
+        quant_hi: 1.2
+        quant_region_mode: half_quant
+        quant_boundary_mode: sticky
+        no_worse_tol: 0.0
+        enforce_no_worse: true
+        cell_scaled_metric: true
+        final_snap: true
+        steps: 20
+        macro_batch_examples: 64
+        inner_steps_per_batch: 20
+
+  - name: qqn_owl_halfquant_6bit_multicell
+    kind: owl_quant
+    phases:
+      - name: stage1_fp32_base
+        kind: adamw
+        steps: 15
+        macro_batch_examples: 32
+        inner_steps_per_batch: 1
+        learning_rate: 1.5e-3
+        warmup_ratio: 0.15
+        weight_decay: 0.01
+        grad_clip_norm: 1.0
+      - name: stage2_owl_multicell
+        kind: owl_quant
+        oracle: lbfgs_adam
+        history_size: 5
+        path_strategy: quadratic
+        ls_max_iter: 5
+        max_t: 1.5
+        learning_rate: 1.25
+        max_qn_gain: 4.0
+        warm_start_preconditioner: true
+        quant_qtype: uniform
+        quant_bits: 6
+        quant_lo: -1.2
+        quant_hi: 1.2
+        quant_region_mode: half_quant
+        quant_boundary_mode: owl_snap
+        no_worse_tol: 0.0
+        enforce_no_worse: true
+        cell_scaled_metric: true
+        final_snap: true
+        steps: 20
+        macro_batch_examples: 64
+        inner_steps_per_batch: 20
